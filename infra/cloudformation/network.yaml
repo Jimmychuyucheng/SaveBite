@@ -1,4 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
+# SaveBite 網路 stack（只含免費資源）：跨兩個 AZ 的 VPC、六個子網路、
+# Internet Gateway、路由表、S3 Gateway Endpoint 與所有 Security Group。
+# NAT Gateway 與其路由由 savebite-runtime stack 加上。
+#
+# 注意：模板與參數的 Description 要維持英文。實測 CloudFormation 會把
+# Description 裡的中文換成「?」；以 # 開頭的註解不會送到 AWS，可以用中文。
 Description: >
   SaveBite network stack (free resources only): VPC across two AZs, six subnets,
   Internet Gateway, route tables, S3 Gateway Endpoint, and all security groups.
@@ -13,13 +19,13 @@ Parameters:
     Default: us-east-1b
 
 Resources:
-  # ---------- VPC & Internet Gateway ----------
+  # ---------- VPC 與 Internet Gateway ----------
   Vpc:
     Type: AWS::EC2::VPC
     Properties:
       CidrBlock: 10.0.0.0/16
       EnableDnsSupport: true
-      EnableDnsHostnames: true   # needed for SSM and VPC endpoints
+      EnableDnsHostnames: true   # SSM 與 VPC endpoint 需要
       Tags: [{ Key: Name, Value: savebite-vpc }]
 
   InternetGateway:
@@ -33,8 +39,8 @@ Resources:
       VpcId: !Ref Vpc
       InternetGatewayId: !Ref InternetGateway
 
-  # ---------- Subnets ----------
-  # Public: ALB, NAT. No auto-assigned public IPs (public IPv4 is billed).
+  # ---------- 子網路 ----------
+  # 公有子網路：ALB、NAT。不自動配公有 IP（公有 IPv4 要收費）。
   PublicSubnetA:
     Type: AWS::EC2::Subnet
     Properties:
@@ -53,7 +59,7 @@ Resources:
       MapPublicIpOnLaunch: false
       Tags: [{ Key: Name, Value: savebite-public-b }]
 
-  # Private app: EC2.
+  # 私有應用子網路：EC2。
   AppSubnetA:
     Type: AWS::EC2::Subnet
     Properties:
@@ -72,7 +78,7 @@ Resources:
       MapPublicIpOnLaunch: false
       Tags: [{ Key: Name, Value: savebite-app-b }]
 
-  # Private data: RDS, ElastiCache, Lambda.
+  # 私有資料子網路：RDS、ElastiCache、Lambda。
   DataSubnetA:
     Type: AWS::EC2::Subnet
     Properties:
@@ -91,7 +97,7 @@ Resources:
       MapPublicIpOnLaunch: false
       Tags: [{ Key: Name, Value: savebite-data-b }]
 
-  # ---------- Route tables ----------
+  # ---------- 路由表 ----------
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -118,7 +124,7 @@ Resources:
       SubnetId: !Ref PublicSubnetB
       RouteTableId: !Ref PublicRouteTable
 
-  # App route tables: 0.0.0.0/0 -> NAT is added by the runtime stack.
+  # 應用路由表：0.0.0.0/0 -> NAT 的路由由 runtime stack 加上。
   AppRouteTableA:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -143,7 +149,7 @@ Resources:
       SubnetId: !Ref AppSubnetB
       RouteTableId: !Ref AppRouteTableB
 
-  # Data route tables: local + S3 endpoint only, no internet route.
+  # 資料路由表：只有 local 與 S3 endpoint，沒有對外路由。
   DataRouteTableA:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -168,7 +174,7 @@ Resources:
       SubnetId: !Ref DataSubnetB
       RouteTableId: !Ref DataRouteTableB
 
-  # ---------- S3 Gateway Endpoint (free) ----------
+  # ---------- S3 Gateway Endpoint（免費） ----------
   S3GatewayEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
@@ -181,7 +187,9 @@ Resources:
         - !Ref DataRouteTableA
         - !Ref DataRouteTableB
 
-  # ---------- Security groups ----------
+  # ---------- Security Group ----------
+  # 注意：GroupDescription 與規則的 Description 只能用 ASCII，維持英文；
+  # 修改 GroupDescription 會讓 SG 被刪除重建。
   AlbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -216,8 +224,8 @@ Resources:
       GroupName: lambda-sg
       GroupDescription: Lambda - no inbound; outbound only to DB and Redis
       VpcId: !Ref Vpc
-      # Specifying an egress rule removes the default allow-all egress.
-      # This placeholder matches nothing; real egress rules are added below.
+      # 只要指定任何 egress 規則，就會移除預設的「全部允許對外」。
+      # 這條佔位規則不會比對到任何流量；真正的對外規則在下面另外加。
       SecurityGroupEgress:
         - IpProtocol: icmp
           FromPort: -1

@@ -1,4 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
+# SaveBite 基礎 stack（免費或幾乎免費，常駐）：Cognito user pool 與
+# public app client、S3 照片 bucket、新貼文 Email 通知的 SNS topic、
+# SQS 失敗佇列（DLQ），以及 EventBridge Scheduler 的 schedule group。
+#
+# 注意：模板與參數的 Description 要維持英文。實測 CloudFormation 會把
+# Description 裡的中文換成「?」；以 # 開頭的註解不會送到 AWS，可以用中文。
 Description: >
   SaveBite base stack (free or near-free, long-lived): Cognito user pool and
   public app client, S3 photo bucket, SNS topic for new-listing emails,
@@ -8,6 +14,8 @@ Parameters:
   PhotoCorsOrigins:
     Type: CommaDelimitedList
     Default: "*"
+    # 允許瀏覽器對照片 bucket 做 PUT／GET 的來源。開發期用 "*"；
+    # runtime stack 建好後改成 ALB 網址與 localhost（見 ARCHITECTURE.md §6.10）。
     Description: >
       Allowed origins for browser PUT/GET to the photo bucket. Use "*" during
       development; once the runtime stack exists, change to
@@ -23,10 +31,10 @@ Resources:
     Type: AWS::Cognito::UserPool
     Properties:
       UserPoolName: savebite-users
-      UsernameAttributes: [email]          # sign in with email
-      AutoVerifiedAttributes: [email]      # email verification code on sign-up
+      UsernameAttributes: [email]          # 用 email 登入
+      AutoVerifiedAttributes: [email]      # 註冊時寄 email 驗證碼
       AdminCreateUserConfig:
-        AllowAdminCreateUserOnly: false    # self sign-up enabled
+        AllowAdminCreateUserOnly: false    # 開放自行註冊
       Schema:
         - Name: email
           AttributeDataType: String
@@ -49,7 +57,7 @@ Resources:
           - Name: verified_email
             Priority: 1
       EmailConfiguration:
-        EmailSendingAccount: COGNITO_DEFAULT   # ~50 emails/day limit
+        EmailSendingAccount: COGNITO_DEFAULT   # 內建寄信每天約 50 封上限
       MfaConfiguration: "OFF"
 
   UserPoolClient:
@@ -57,7 +65,7 @@ Resources:
     Properties:
       ClientName: savebite-web
       UserPoolId: !Ref UserPool
-      GenerateSecret: false                # public client: no SECRET_HASH needed
+      GenerateSecret: false                # public client：不需要 SECRET_HASH
       ExplicitAuthFlows:
         - ALLOW_USER_PASSWORD_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
@@ -71,7 +79,7 @@ Resources:
         IdToken: minutes
         RefreshToken: days
 
-  # ---------- S3 photos ----------
+  # ---------- S3 照片 ----------
   PhotoBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -118,7 +126,7 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: savebite-dlq
-      MessageRetentionPeriod: 1209600   # 14 days
+      MessageRetentionPeriod: 1209600   # 14 天
 
   # ---------- EventBridge Scheduler ----------
   ScheduleGroup:
