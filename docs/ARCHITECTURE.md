@@ -41,7 +41,7 @@
 | Stack | 內容 | 費用 | 生命週期 |
 |---|---|---|---|
 | `savebite-network` | VPC、6 個子網路、IGW、路由表、S3 Gateway Endpoint、所有 Security Group | 免費 | 常駐 |
-| `savebite-base` | Cognito user pool 與 app client、S3 照片 bucket（含 CORS、Lifecycle）、SNS topic、SQS DLQ、Scheduler schedule group | 免費或幾乎免費 | 常駐 |
+| `savebite-base` | Cognito user pool 與 app client、S3 照片 bucket（含 CORS、Lifecycle）、S3 部署檔 bucket、SNS topic、SQS DLQ、Scheduler schedule group | 免費或幾乎免費 | 常駐 |
 | `savebite-runtime` | NAT Gateway、ALB、Auto Scaling（EC2）、RDS、ElastiCache、Lambda、安全網掃描的 EventBridge rule | 計費 | 用完就刪 |
 
 `savebite-runtime` 參數：
@@ -551,6 +551,15 @@ docs/                     本文件、CONSOLE_SETUP.md
 
 壓測用的測試登入只能在 `APP_ENV=loadtest` 時啟用（見 7.1）。
 
+### 8.4 部署到 EC2
+
+- `scripts/package-backend.sh` 用 `git archive` 打包**已 commit** 的 `backend/`，上傳到 S3 部署檔 bucket（`releases/backend-<git sha>.tar.gz`）。key 帶 git sha，S3 上的每個版本都對得到 commit
+- runtime stack 的參數 `AppArtifactKey` 指定要部署哪個版本。EC2 開機時經 S3 Gateway Endpoint 下載、安裝套件（經 NAT 連 PyPI），用 systemd 啟動 uvicorn
+- 開機完成並確認本機 `/health` 正常後，用 `cfn-signal` 回報 CloudFormation；兩台都回報成功，stack 才算建立完成
+- 換版本時更新 `AppArtifactKey`，Auto Scaling 用 rolling update 一次換一台，至少保留 1 台服務
+- 選擇打包上傳 S3、而不是開機時 `git clone`：每次開機抓到的版本固定，不會因為 `main` 有新 commit 而讓兩台跑不同版本
+- 詳細步驟見 CONSOLE_SETUP.md §8
+
 ---
 
 ## 9. 實驗
@@ -579,6 +588,9 @@ docs/                     本文件、CONSOLE_SETUP.md
   - `fail-always`：10:48:12、10:49:19、10:51:34 共執行 3 次（同一個 request ID，間隔約 1 分鐘、2 分鐘）→ DLQ 收到 1 則 Lambda 失敗目的地的訊息（`condition = RetriesExhausted`、`approximateInvokeCount = 3`）
   - 判斷：request ID 不變而且次數等於 Lambda 的設定，代表是 Lambda 在重試；Scheduler 沒有額外重試（Scheduler 重試的話 request ID 會換新）
   - 一次性排程設了 `ActionAfterCompletion=DELETE`，執行完確實自動刪除
+- ✅ **runtime 第一段（2026-11-27 已驗證）**：NAT、ALB、Auto Scaling（EC2 × 2，LabInstanceProfile）都能用 CloudFormation 建立
+  - EC2 經 NAT 對外連線正常；Systems Manager（Run Command）可以連到私有子網路的 EC2
+  - 終止一台 EC2：服務沒有完全中斷，約 19 秒內部分請求失敗（147 個中 6 個），2 分 17 秒後恢復成 2 台。詳細數據見 CONSOLE_SETUP.md §8
 - **ElastiCache**：Learner Lab 實際建立時是否可用
 - **只有 HTTP**：Learner Lab 不能註冊網域，ALB 沒有正式憑證，只能用 HTTP，登入密碼以明文傳輸。課程專案可接受，報告中要列為已知限制
 - 預約保留時間（目前預設 30 分鐘）、每人每次預約上限、未登入輪詢間隔、WebSocket 訂閱格子上限

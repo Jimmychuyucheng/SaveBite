@@ -1,0 +1,284 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# SaveBite runtime stack（會計費，用完當天就刪除）。
+#
+# 分段建立：
+#   第一段（本檔目前內容）：NAT Gateway、ALB、Launch Template、Auto Scaling group（EC2 × 2）
+#   第二段（之後）：RDS、ElastiCache、Lambda、安全網掃描的 EventBridge rule
+#   第三段（之後）：CloudWatch 告警與 dashboard
+#
+# 依賴：savebite-network（子網路、路由表、SG）、savebite-base（部署檔 bucket）的 export。
+#
+# 注意：模板與參數的 Description 要維持英文（實測 CloudFormation 會把中文換成「?」）。
+Description: >
+  SaveBite runtime stack (billed; delete after use). Phase 1: NAT Gateway(s),
+  ALB, launch template, and an Auto Scaling group of two EC2 instances.
+
+Parameters:
+  NetworkStackName:
+    Type: String
+    Default: savebite-network
+  BaseStackName:
+    Type: String
+    Default: savebite-base
+  NatGatewayCount:
+    Type: String
+    AllowedValues: ["1", "2"]
+    Default: "1"
+    Description: 1 = single NAT in AZ-a (development); 2 = one NAT per AZ (HA experiments).
+  InstanceType:
+    Type: String
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Default: t3.small
+  LatestAmiId:
+    # Amazon Linux 2023 最新 AMI（由 AWS 公開的 SSM 參數解析）
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  AppArtifactKey:
+    Type: String
+    AllowedPattern: "releases/backend-[0-9a-f]+\\.tar\\.gz"
+    Description: S3 key of the backend package in the artifact bucket (from scripts/package-backend.sh).
+  AppEnv:
+    Type: String
+    AllowedValues: [dev, loadtest, prod]
+    Default: dev
+  AppDatabaseUrl:
+    # 第一段還沒有 RDS，先用連不到的位址（程式設計成 DB 連不上也能啟動，/health 照樣 200）。
+    # 第二段加入 RDS 後改成從 Secrets Manager 取得，不再用這個參數。
+    Type: String
+    NoEcho: true
+    Default: postgresql://placeholder@127.0.0.1:5432/none
+
+Conditions:
+  TwoNats: !Equals [!Ref NatGatewayCount, "2"]
+
+Resources:
+  # ---------- NAT Gateway ----------
+  NatEipA:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: savebite-nat-a }]
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !ImportValue { "Fn::Sub": "${NetworkStackName}-PublicSubnetA" }
+      Tags: [{ Key: Name, Value: savebite-nat-a }]
+
+  NatEipB:
+    Type: AWS::EC2::EIP
+    Condition: TwoNats
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: savebite-nat-b }]
+
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Condition: TwoNats
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      SubnetId: !ImportValue { "Fn::Sub": "${NetworkStackName}-PublicSubnetB" }
+      Tags: [{ Key: Name, Value: savebite-nat-b }]
+
+  # 應用子網路的對外路由：NatGatewayCount=1 時兩個 AZ 都走 AZ-a 的 NAT
+  AppRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !ImportValue { "Fn::Sub": "${NetworkStackName}-AppRouteTableA" }
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  AppRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !ImportValue { "Fn::Sub": "${NetworkStackName}-AppRouteTableB" }
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [TwoNats, !Ref NatGatewayB, !Ref NatGatewayA]
+
+  # ---------- ALB ----------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: savebite-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-PublicSubnetA" }
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-PublicSubnetB" }
+      SecurityGroups:
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-AlbSg" }
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "60"                 # WebSocket 心跳 30 秒，小於這個值
+      Tags: [{ Key: Name, Value: savebite-alb }]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: savebite-app-tg
+      VpcId: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+      Protocol: HTTP
+      Port: 8000
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health          # 只確認程式活著，不檢查 RDS／Redis（§6.7）
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2        # 約 20 秒判定不健康，故障實驗比較快看到效果
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"                   # 預設 300 秒太長，換機或實驗時等太久
+        - Key: stickiness.enabled
+          Value: "false"                # 推播靠 Redis 跨機同步，不需要黏著同一台
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------- EC2 ----------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: savebite-app
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags: [{ Key: Name, Value: savebite-app }]
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: LabInstanceProfile      # Learner Lab 現成的；SSM 連線與 S3 下載都靠它
+        SecurityGroupIds:
+          - !ImportValue { "Fn::Sub": "${NetworkStackName}-AppSg" }
+        MetadataOptions:
+          HttpTokens: required          # 只允許 IMDSv2
+          HttpEndpoint: enabled
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: savebite-app }
+              - { Key: project, Value: savebite }
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: savebite-app }
+              - { Key: project, Value: savebite }
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                #!/bin/bash
+                # 開機設定：安裝 Python 3.11 → 從 S3 下載後端 → 用 systemd 啟動 uvicorn → 回報 CloudFormation
+                set -euxo pipefail
+                exec > >(tee /var/log/savebite-userdata.log) 2>&1
+
+                signal() {
+                  /opt/aws/bin/cfn-signal -e "$1" --stack ${AWS::StackName} \
+                    --resource AppAutoScalingGroup --region ${AWS::Region} || true
+                }
+                # 任何一步失敗都回報失敗，CloudFormation 才不會空等到逾時
+                trap 'signal 1' ERR
+
+                dnf install -y python3.11 python3.11-pip aws-cfn-bootstrap
+
+                useradd --system --home-dir /opt/savebite --shell /sbin/nologin savebite || true
+                mkdir -p /opt/savebite /etc/savebite
+
+                aws s3 cp s3://${ArtifactBucket}/${AppArtifactKey} /tmp/backend.tar.gz --region ${AWS::Region}
+                rm -rf /opt/savebite/backend
+                tar -xzf /tmp/backend.tar.gz -C /opt/savebite     # 解出 /opt/savebite/backend
+                python3.11 -m venv /opt/savebite/venv
+                /opt/savebite/venv/bin/pip install --no-cache-dir -r /opt/savebite/backend/requirements.txt
+                chown -R savebite:savebite /opt/savebite
+
+                # 環境變數（見 ARCHITECTURE.md §8.3）。EC2 上不設 AWS_PROFILE，改用 LabInstanceProfile
+                cat > /etc/savebite/env <<'ENVEOF'
+                APP_ENV=${AppEnv}
+                AWS_REGION=${AWS::Region}
+                DATABASE_URL=${AppDatabaseUrl}
+                ENVEOF
+                chown root:savebite /etc/savebite/env
+                chmod 640 /etc/savebite/env
+
+                cat > /etc/systemd/system/savebite.service <<'UNITEOF'
+                [Unit]
+                Description=SaveBite FastAPI
+                After=network-online.target
+                Wants=network-online.target
+
+                [Service]
+                User=savebite
+                WorkingDirectory=/opt/savebite/backend
+                EnvironmentFile=/etc/savebite/env
+                ExecStart=/opt/savebite/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips '*'
+                Restart=always
+                RestartSec=3
+
+                [Install]
+                WantedBy=multi-user.target
+                UNITEOF
+
+                systemctl daemon-reload
+                systemctl enable --now savebite
+
+                # 等本機 /health 回 200 才回報成功
+                for i in $(seq 1 30); do
+                  if curl -fsS http://127.0.0.1:8000/health; then signal 0; exit 0; fi
+                  sleep 2
+                done
+                signal 1
+              - ArtifactBucket: !ImportValue { "Fn::Sub": "${BaseStackName}-ArtifactBucket" }
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Count: 2                        # 兩台都回報成功，stack 才算建立完成
+        Timeout: PT15M
+    UpdatePolicy:
+      # 換新版本（AppArtifactKey 或 Launch Template 改變）時一次換一台，至少保留 1 台服務
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+    DependsOn: [AppRouteA, AppRouteB]   # 開機時要經 NAT 安裝套件
+    Properties:
+      AutoScalingGroupName: savebite-app-asg
+      MinSize: "2"                      # 固定 2 台：目的是容錯，不做擴展（§4.2）
+      MaxSize: "2"
+      DesiredCapacity: "2"
+      VPCZoneIdentifier:
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-AppSubnetA" }
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-AppSubnetB" }
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB              # 依 ALB 健康檢查判斷，程式掛了也會被替換
+      HealthCheckGracePeriod: 300       # 開機安裝套件約需幾分鐘
+      Tags:
+        - { Key: project, Value: savebite, PropagateAtLaunch: true }
+
+Outputs:
+  AlbDnsName:
+    Description: Open http://<this value>/health in a browser.
+    Value: !GetAtt LoadBalancer.DNSName
+    Export: { Name: !Sub "${AWS::StackName}-AlbDnsName" }
+  AlbFullName:
+    Value: !GetAtt LoadBalancer.LoadBalancerFullName
+    Export: { Name: !Sub "${AWS::StackName}-AlbFullName" }
+  TargetGroupFullName:
+    Value: !GetAtt TargetGroup.TargetGroupFullName
+    Export: { Name: !Sub "${AWS::StackName}-TargetGroupFullName" }
+  AutoScalingGroupName:
+    Value: !Ref AppAutoScalingGroup
+    Export: { Name: !Sub "${AWS::StackName}-AsgName" }

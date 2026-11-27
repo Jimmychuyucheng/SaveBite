@@ -20,8 +20,8 @@
 | Stack | 狀態 | 建立日期 | 費用 |
 |---|---|---|---|
 | `savebite-network` | ✅ `CREATE_COMPLETE` | 2026-11-27 | $0 |
-| `savebite-base` | ✅ `CREATE_COMPLETE` | 2026-11-27 | $0（Cognito Essentials 每月 1 萬名活躍使用者內免費） |
-| `savebite-runtime` | 尚未建立（程式寫好才建） | | 計費 |
+| `savebite-base` | ✅ `UPDATE_COMPLETE`（11-27 新增 artifacts bucket） | 2026-11-27 | $0（Cognito Essentials 每月 1 萬名活躍使用者內免費） |
+| `savebite-runtime` | ⬜ 目前不存在。第一段已在 11-27 測試後刪除（見 §8） | | 第一段約 $0.13／小時 |
 
 ## 2. savebite-network
 
@@ -88,6 +88,7 @@ aws cloudformation wait stack-create-complete --profile savebite-lab --region us
 | Cognito user pool | `savebite-users` | `us-east-1_DkMCcYzHj` |
 | Cognito app client | `savebite-web`（public，無 secret） | `10smpea8iso4956j551o8318lg` |
 | S3 照片 bucket | `savebite-photos-126811246350` | `arn:aws:s3:::savebite-photos-126811246350` |
+| S3 部署檔 bucket | `savebite-artifacts-126811246350` | 放 `releases/backend-<sha>.tar.gz`，60 天後刪除 |
 | SNS topic | `savebite-new-listings` | `arn:aws:sns:us-east-1:126811246350:savebite-new-listings` |
 | SQS DLQ | `savebite-dlq`（保留 14 天） | `arn:aws:sqs:us-east-1:126811246350:savebite-dlq` |
 | Scheduler schedule group | `savebite` | |
@@ -136,6 +137,9 @@ aws cloudformation delete-stack --profile savebite-lab --region us-east-1 --stac
 | 2026-11-27 | 建立 `savebite-network`、`savebite-base` |
 | 2026-11-27 | 刪除測試用 user pool `User pool - rrletp`（`us-east-1_c1v2XzVOL`），先刪掉它的 domain、關閉刪除保護才刪除 |
 | 2026-11-27 | Scheduler + LabRole 驗證：暫時建立 Lambda `savebite-scheduler-test` 和排程 `test-fail-once`、`test-fail-always`（group `savebite`），驗證後全部刪除（Lambda、log group、S3 `test/` 下的 marker），並清空 `savebite-dlq`。結果見 ARCHITECTURE.md §11 |
+| 2026-11-27 | 更新 `savebite-base`：新增 S3 部署檔 bucket `savebite-artifacts-126811246350`（其他資源不變） |
+| 2026-11-27 | 上傳 `releases/backend-a886d49fc215.tar.gz`（`main` 的 A1 骨架） |
+| 2026-11-27 | 建立 `savebite-runtime` 第一段（13:23:41–13:27:56 UTC），測試後刪除（13:31:46–13:34:54 UTC），共開約 11 分鐘，費用約 $0.03 |
 
 ## 7. Scheduler 與 Lambda 的設定方式（已驗證）
 
@@ -146,3 +150,86 @@ aws cloudformation delete-stack --profile savebite-lab --region us-east-1 --stac
 - 排程 target：`RetryPolicy={MaximumRetryAttempts: 2, MaximumEventAgeInSeconds: 3600}`、`DeadLetterConfig={Arn: <savebite-dlq ARN>}`
 - Lambda 非同步設定（`PutFunctionEventInvokeConfig`）：`MaximumRetryAttempts=2`、`MaximumEventAgeInSeconds=3600`、`DestinationConfig.OnFailure.Destination=<savebite-dlq ARN>`
 - 函式錯誤由 Lambda 的非同步重試處理，Scheduler 的 retry 只處理投遞失敗
+
+## 8. savebite-runtime
+
+目前模板只有**第一段**：NAT Gateway、ALB、Launch Template、Auto Scaling group（EC2 × 2）。RDS、ElastiCache、Lambda 之後再加。**用完當天就刪除。**
+
+### 部署步驟
+
+```bash
+# 1. 打包已 commit 的 backend/ 並上傳，記下最後一行印出的 AppArtifactKey
+scripts/package-backend.sh
+
+# 2. 建立 stack（開發時 NAT 1 個；實驗一、二改成 NatGatewayCount=2）
+aws cloudformation create-stack --profile savebite-lab --region us-east-1 \
+  --stack-name savebite-runtime \
+  --template-body file://infra/cloudformation/runtime.yaml \
+  --parameters ParameterKey=AppArtifactKey,ParameterValue=<上一步的 key> \
+               ParameterKey=NatGatewayCount,ParameterValue=1 \
+  --tags Key=project,Value=savebite
+aws cloudformation wait stack-create-complete --profile savebite-lab --region us-east-1 \
+  --stack-name savebite-runtime
+
+# 3. 取得 ALB 網址
+aws cloudformation describe-stacks --profile savebite-lab --region us-east-1 \
+  --stack-name savebite-runtime \
+  --query "Stacks[0].Outputs[?OutputKey=='AlbDnsName'].OutputValue" --output text
+```
+
+**換新版本**：commit 後重跑 `package-backend.sh`，再用 `update-stack` 把 `AppArtifactKey` 改成新的 key（其他參數用 `UsePreviousValue=true`）。Auto Scaling 會一次換一台，至少保留一台在服務。
+
+**刪除**（每次測完都要做）：
+
+```bash
+aws cloudformation delete-stack --profile savebite-lab --region us-east-1 --stack-name savebite-runtime
+aws cloudformation wait stack-delete-complete --profile savebite-lab --region us-east-1 --stack-name savebite-runtime
+```
+
+### 參數
+
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `AppArtifactKey` | （必填） | `package-backend.sh` 印出的 S3 key |
+| `NatGatewayCount` | `1` | 實驗一、二改成 `2` |
+| `InstanceType` | `t3.small` | 可選 t3.micro／small／medium |
+| `AppEnv` | `dev` | 壓測時改成 `loadtest` |
+| `AppDatabaseUrl` | 連不到的佔位位址 | 第一段還沒有 RDS；第二段改成從 Secrets Manager 取得 |
+
+### EC2 開機流程（user data）
+
+1. `dnf install python3.11 python3.11-pip aws-cfn-bootstrap`
+2. 從 artifacts bucket 下載打包檔，解壓到 `/opt/savebite/backend`，建立 venv 並安裝 `requirements.txt`
+3. 寫入 `/etc/savebite/env`（環境變數），建立 systemd 服務 `savebite`（uvicorn，port 8000）
+4. 本機 `/health` 回 200 後，用 `cfn-signal` 回報成功；任何一步失敗就回報失敗
+
+除錯：用 Session Manager 連進 EC2（Console → EC2 → 選機器 → Connect → Session Manager），查看：
+- 開機日誌：`sudo cat /var/log/savebite-userdata.log`
+- 服務狀態與日誌：`systemctl status savebite`、`sudo journalctl -u savebite -n 100`
+
+### 2026-11-27 第一段測試結果
+
+| 項目 | 結果 |
+|---|---|
+| 建立時間 | 4 分 15 秒（兩台都回報成功才算完成） |
+| ALB `/health` | ✅ 200，約 0.45 秒（從台灣連線） |
+| EC2 分布 | ✅ us-east-1a、us-east-1b 各一台，target group 都 healthy |
+| SSM | ✅ 兩台都 Online，Run Command 可執行 |
+| 經 NAT 對外 | ✅ 兩台的對外 IP 都是 NAT 的 EIP（1b 跨 AZ 走 1a 的 NAT）；連 Cognito endpoint 正常 |
+| Python | 3.11.18 |
+| 終止一台 EC2 | 見下 |
+
+**終止 1a 的 EC2（直接從 EC2 終止，模擬機器故障）**，同時每 0.5 秒打一次 ALB `/health`：
+
+| 時間（UTC） | 事件 |
+|---|---|
+| 13:29:07 | 終止 `i-0433fb2c7cc03cd09`（1a） |
+| 13:29:10–13:29:26 | 6 個請求失敗（3 個 502、3 個 3 秒逾時），**中間的請求仍然成功**（被送到 1b） |
+| 13:29:29 | target group 只剩 1b 那台，之後全部成功 |
+| 13:30:03 | Auto Scaling 發現機器不見（約 56 秒後） |
+| 13:30:05 | 開始啟動新機器 `i-0aa694d9b66d284ad` |
+| 13:31:24 | 新機器 healthy，恢復成 2 台 |
+
+- **服務沒有完全中斷**：受影響時間約 19 秒，期間部分請求失敗；整段 147 個請求中有 6 個失敗（4.1%）
+- **恢復成 2 台花了 2 分 17 秒**
+- 失敗集中在 ALB 還沒判定那台不健康的期間（健康檢查 10 秒一次、連續 2 次失敗才判定）

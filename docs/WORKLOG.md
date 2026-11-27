@@ -71,6 +71,10 @@
 | 11-27 | 不走 Scheduler 的退路，個別排程照原設計 | 實測 Scheduler + LabRole 可用 |
 | 11-27 | 回覆、文件、註解、commit、PR、留言一律用繁體中文；識別字和資源名稱用英文 | 組長要求 |
 | 11-27 | CloudFormation 的 `Description`、SG 的 `GroupDescription` 維持英文 | 實測中文會被換成「?」；SG 描述只能用 ASCII，而且修改會讓 SG 重建 |
+| 11-27 | 組長負責 C（網路與基礎設施）；A1 骨架屬於 B 的範圍、A2 migration 屬於 A 的範圍，A2 先暫停，交給 A | 避免做到別人的範圍；ARCHITECTURE.md 中 A、B 負責的部分請他們確認 |
+| 11-27 | runtime stack 可以分段建立測試，但當天刪除（CLAUDE.md 規則已改） | 不必等程式全部寫好，就能先驗證 NAT、ALB、Auto Scaling |
+| 11-27 | 程式碼用「打包上傳 S3」部署到 EC2，不用開機 `git clone` | 版本固定、對得到 commit，兩台不會跑不同版本 |
+| 11-27 | RDS 密碼用 Secrets Manager（`ManageMasterUserPassword`）；EC2 t3.small、RDS db.t3.micro；ElastiCache 開發時單一節點 | 第二段實作時採用；EC2 能否讀 Secrets Manager 要實測 |
 
 ---
 
@@ -97,6 +101,19 @@
 
 ### 2026-11-27 刪除測試 user pool `User pool - rrletp`
 - 它開了刪除保護、掛著 domain，所以先刪 domain、關掉保護，再刪除 pool
+
+### 2026-11-27 runtime 第一段（`infra/runtime-compute`）
+- **寫了**：
+  - `runtime.yaml` 第一段：NAT（依 `NatGatewayCount` 建 1 或 2 個）、ALB、target group、Launch Template、Auto Scaling group
+  - `base.yaml` 新增 S3 部署檔 bucket
+  - `scripts/package-backend.sh`：打包已 commit 的 `backend/` 並上傳
+- **EC2 開機流程**：安裝 Python 3.11 → 從 S3 下載後端 → systemd 啟動 uvicorn → 本機 `/health` 正常後用 `cfn-signal` 回報；任何一步失敗就回報失敗
+- **部署**：
+  - 更新 `savebite-base`：只新增 artifacts bucket
+  - 上傳 `releases/backend-a886d49fc215.tar.gz`
+  - 建立 runtime：4 分 15 秒
+  - 測試完當天刪除：前後共開約 11 分鐘，費用約 $0.03
+- 第一段還沒有 RDS，`DATABASE_URL` 指向連不到的位址；程式照樣啟動，`/health` 回 200，剛好也驗證了 §6.7 的設計
 
 ---
 
@@ -125,6 +142,18 @@
 - 已刪除全部暫時資源並清空 DLQ
 - 結果寫回 ARCHITECTURE.md §6.3、§11，以及 CONSOLE_SETUP.md §6、§7
 
+### 2026-11-27 runtime 第一段測試 ✅
+- ALB `/health` 回 200；兩台 EC2 分別在 1a、1b，都 healthy
+- SSM：兩台 Online，Run Command 可以執行（**SSM 經 NAT 可用**）
+- 兩台的對外 IP 都是 NAT 的 EIP，1b 跨 AZ 走 1a 的 NAT；連 Cognito endpoint 正常
+- **終止 1a 的 EC2（實驗一預演）**，同時每 0.5 秒打一次 ALB：
+  - 約 19 秒內 6 個請求失敗（3 個 502、3 個逾時），其他請求仍然成功，**服務沒有完全中斷**
+  - 整段 147 個請求中失敗率 4.1%
+  - Auto Scaling 約 56 秒後發現；**2 分 17 秒後恢復成 2 台**
+  - 失敗集中在 ALB 還沒判定不健康的期間（10 秒一次、連續 2 次失敗才判定）
+- 小插曲：探測腳本跑到 13:31:29 就停了（應該跑 8 分鐘），推測是背景 shell 結束時被一起關掉；這時已經涵蓋到恢復完成，不影響結論。正式實驗要改用不會被中斷的方式（例如 k6 或 `nohup`）
+- 結果寫進 CONSOLE_SETUP.md §8、ARCHITECTURE.md §11
+
 ---
 
 ## 5. Git 與工作流程
@@ -141,7 +170,8 @@
 | 11-27 | main 上已有的兩個英文 commit（`be6c758`、`a86d665`）不改寫，避免對 main 強制推送 | |
 | 11-27 | 模板註解改成中文 | `chore/zh-comments` → [PR #2](https://github.com/Jimmychuyucheng/SaveBite/pull/2) |
 | 11-27 | 合併 PR #1、#2（用 merge commit；之後建議改用 squash） | `e9586fe`、`b74fbe6` |
-| 11-27 | A1 本機開發骨架 | `feat/backend-skeleton` |
+| 11-27 | A1 本機開發骨架 | `feat/backend-skeleton` → PR #3（squash 合併 `a886d49`） |
+| 11-27 | runtime 第一段 | `infra/runtime-compute` |
 
 ---
 
@@ -170,7 +200,7 @@
 - 本機 `.env` 用隨機產生的本機密碼，已確認被 `.gitignore` 排除
 
 ### 下一步
-- **A2**：Alembic migration（照 ARCHITECTURE.md 第 5 節的 SQL）
+- **A2**（Alembic migration）屬於 A 組員的範圍，暫停，交給 A
 
 ---
 
@@ -180,6 +210,13 @@
 - [x] 刪除 Scheduler 驗證的暫時資源
 - [x] 推送 `docs/scheduler-verification` 並開 PR（含 WORKLOG.md）
 - [x] 組長確認並合併 PR #1（驗證結果與工作紀錄）、PR #2（模板中文註解）
-- [x] A1 本機開發骨架（PR 待確認）
-- [ ] A2 資料表 migration
-- [ ] runtime stack 建好後：S3 CORS 改成只允許 ALB 網址和 localhost；測試 EC2 能否 PassRole LabRole
+- [x] A1 本機開發骨架（PR #3 已合併）
+- [ ] 通知 A、B：ARCHITECTURE.md 中他們負責的部分（§6.1–6.4、§6.9）請確認；A1 骨架交給 B 接手
+- [ ] A2 資料表 migration（**A 組員**負責）
+- [x] runtime 第一段：NAT、ALB、Auto Scaling（已測試並刪除）
+- [ ] runtime 第二段：RDS（Secrets Manager 密碼）、ElastiCache、Lambda、安全網掃描 EventBridge rule
+- [ ] 監控：CloudWatch agent（應用日誌）、告警（ALB 5xx、UnHealthyHostCount、RDS、DLQ）、dashboard
+- [ ] 部署與刪除 runtime 的腳本
+- [ ] 待驗證：ElastiCache 在 Lab 能否建立、EC2 能否 PassRole LabRole、EC2 能否讀 Secrets Manager
+- [ ] runtime 建好後：S3 CORS 改成只允許 ALB 網址和 localhost
+- [ ] 實驗一（`NatGatewayCount=2`，配合 A 的 k6 腳本）
