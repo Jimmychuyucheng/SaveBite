@@ -1,0 +1,6 @@
+# 開發與測試用套件
+-r requirements.txt
+pytest==9.2.0
+pytest-asyncio==1.5.0
+httpx2==2.16.2              # FastAPI TestClient 需要（Starlette 已改用 httpx2，舊的 httpx 會出現棄用警告）
+ruff==0.17.6
