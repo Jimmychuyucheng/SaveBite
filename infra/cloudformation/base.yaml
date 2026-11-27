@@ -114,6 +114,32 @@ Resources:
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 1
 
+  # ---------- S3 部署檔 ----------
+  # 放後端打包檔（releases/backend-<git sha>.tar.gz），EC2 開機時經 S3 Gateway Endpoint 下載。
+  # 和照片 bucket 分開：權限、CORS、Lifecycle 的需求都不同。
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub savebite-artifacts-${AWS::AccountId}
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-releases
+            Status: Enabled
+            Prefix: releases/
+            ExpirationInDays: 60
+
   # ---------- SNS ----------
   NewListingTopic:
     Type: AWS::SNS::Topic
@@ -150,6 +176,9 @@ Outputs:
   PhotoBucketArn:
     Value: !GetAtt PhotoBucket.Arn
     Export: { Name: !Sub "${AWS::StackName}-PhotoBucketArn" }
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+    Export: { Name: !Sub "${AWS::StackName}-ArtifactBucket" }
   NewListingTopicArn:
     Value: !Ref NewListingTopic
     Export: { Name: !Sub "${AWS::StackName}-NewListingTopicArn" }
