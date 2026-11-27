@@ -2,16 +2,19 @@ AWSTemplateFormatVersion: "2010-09-09"
 # SaveBite runtime stack（會計費，用完當天就刪除）。
 #
 # 分段建立：
-#   第一段（本檔目前內容）：NAT Gateway、ALB、Launch Template、Auto Scaling group（EC2 × 2）
-#   第二段（之後）：RDS、ElastiCache、Lambda、安全網掃描的 EventBridge rule
+#   第一段：NAT Gateway、ALB、Launch Template、Auto Scaling group（EC2 × 2）
+#   第二段（本次加入）：RDS（密碼由 Secrets Manager 管理）、ElastiCache Redis、
+#           Secrets Manager interface endpoint、Lambda（佔位程式）、安全網掃描的 EventBridge rule
 #   第三段（之後）：CloudWatch 告警與 dashboard
 #
-# 依賴：savebite-network（子網路、路由表、SG）、savebite-base（部署檔 bucket）的 export。
+# 依賴：savebite-network（子網路、路由表、SG）、savebite-base（部署檔 bucket、Cognito、SNS、DLQ 等）的 export。
 #
-# 注意：模板與參數的 Description 要維持英文（實測 CloudFormation 會把中文換成「?」）。
+# 注意：模板與參數的 Description、SG 的 GroupDescription 要維持英文
+#（實測 CloudFormation 會把 Description 的中文換成「?」；SG 描述只能用 ASCII）。
 Description: >
-  SaveBite runtime stack (billed; delete after use). Phase 1: NAT Gateway(s),
-  ALB, launch template, and an Auto Scaling group of two EC2 instances.
+  SaveBite runtime stack (billed; delete after use). NAT Gateway(s), ALB,
+  Auto Scaling group of two EC2 instances, RDS PostgreSQL, ElastiCache Redis,
+  Secrets Manager interface endpoint, and the release Lambda with its sweep rule.
 
 Parameters:
   NetworkStackName:
@@ -25,10 +28,23 @@ Parameters:
     AllowedValues: ["1", "2"]
     Default: "1"
     Description: 1 = single NAT in AZ-a (development); 2 = one NAT per AZ (HA experiments).
+  RdsMultiAz:
+    Type: String
+    AllowedValues: ["false", "true"]
+    Default: "false"
+    Description: true for the RDS failover experiment (roughly doubles RDS cost).
   InstanceType:
     Type: String
     AllowedValues: [t3.micro, t3.small, t3.medium]
     Default: t3.small
+  DbInstanceClass:
+    Type: String
+    AllowedValues: [db.t3.micro, db.t3.small, db.t4g.micro]
+    Default: db.t3.micro
+  CacheNodeType:
+    Type: String
+    AllowedValues: [cache.t3.micro, cache.t4g.micro]
+    Default: cache.t3.micro
   LatestAmiId:
     # Amazon Linux 2023 最新 AMI（由 AWS 公開的 SSM 參數解析）
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
@@ -41,17 +57,19 @@ Parameters:
     Type: String
     AllowedValues: [dev, loadtest, prod]
     Default: dev
-  AppDatabaseUrl:
-    # 第一段還沒有 RDS，先用連不到的位址（程式設計成 DB 連不上也能啟動，/health 照樣 200）。
-    # 第二段加入 RDS 後改成從 Secrets Manager 取得，不再用這個參數。
-    Type: String
-    NoEcho: true
-    Default: postgresql://placeholder@127.0.0.1:5432/none
+  ReservationHoldMinutes:
+    Type: Number
+    Default: 30
+    MinValue: 1
 
 Conditions:
   TwoNats: !Equals [!Ref NatGatewayCount, "2"]
 
 Resources:
+  # ======================================================================
+  # 第一段：NAT、ALB、EC2
+  # ======================================================================
+
   # ---------- NAT Gateway ----------
   NatEipA:
     Type: AWS::EC2::EIP
@@ -156,7 +174,7 @@ Resources:
         ImageId: !Ref LatestAmiId
         InstanceType: !Ref InstanceType
         IamInstanceProfile:
-          Name: LabInstanceProfile      # Learner Lab 現成的；SSM 連線與 S3 下載都靠它
+          Name: LabInstanceProfile      # Learner Lab 現成的；SSM、S3、Secrets Manager 都靠它
         SecurityGroupIds:
           - !ImportValue { "Fn::Sub": "${NetworkStackName}-AppSg" }
         MetadataOptions:
@@ -176,7 +194,8 @@ Resources:
             Fn::Sub:
               - |
                 #!/bin/bash
-                # 開機設定：安裝 Python 3.11 → 從 S3 下載後端 → 用 systemd 啟動 uvicorn → 回報 CloudFormation
+                # 開機設定：安裝 Python 3.11 → 從 S3 下載後端 → 從 Secrets Manager 取得 DB 密碼
+                # → 寫入環境變數 → 用 systemd 啟動 uvicorn → 回報 CloudFormation
                 set -euxo pipefail
                 exec > >(tee /var/log/savebite-userdata.log) 2>&1
 
@@ -199,12 +218,33 @@ Resources:
                 /opt/savebite/venv/bin/pip install --no-cache-dir -r /opt/savebite/backend/requirements.txt
                 chown -R savebite:savebite /opt/savebite
 
+                # 從 Secrets Manager 取得 RDS 主帳密，組成 DATABASE_URL（帳密做 URL 編碼）。
+                # 密碼不進 user data、不進 CloudFormation 參數，只寫進權限 640 的 /etc/savebite/env。
+                set +x   # 下面幾行不要把密碼印進日誌
+                SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id '${DbSecretArn}' \
+                  --region ${AWS::Region} --query SecretString --output text)
+                DATABASE_URL=$(SECRET_JSON="$SECRET_JSON" python3.11 -c 'import json, os, urllib.parse as up; s = json.loads(os.environ["SECRET_JSON"]); print("postgresql://" + up.quote(s["username"], safe="") + ":" + up.quote(s["password"], safe="") + "@${DbHost}:${DbPort}/savebite")')
+                unset SECRET_JSON
+
                 # 環境變數（見 ARCHITECTURE.md §8.3）。EC2 上不設 AWS_PROFILE，改用 LabInstanceProfile
-                cat > /etc/savebite/env <<'ENVEOF'
-                APP_ENV=${AppEnv}
-                AWS_REGION=${AWS::Region}
-                DATABASE_URL=${AppDatabaseUrl}
-                ENVEOF
+                umask 027
+                {
+                  echo "APP_ENV=${AppEnv}"
+                  echo "AWS_REGION=${AWS::Region}"
+                  echo "DATABASE_URL=$DATABASE_URL"
+                  echo "REDIS_URL=redis://${RedisHost}:${RedisPort}/0"
+                  echo "COGNITO_USER_POOL_ID=${UserPoolId}"
+                  echo "COGNITO_APP_CLIENT_ID=${UserPoolClientId}"
+                  echo "PHOTO_BUCKET=${PhotoBucket}"
+                  echo "SNS_TOPIC_ARN=${TopicArn}"
+                  echo "RELEASE_LAMBDA_ARN=${ReleaseFunction.Arn}"
+                  echo "SCHEDULER_ROLE_ARN=arn:aws:iam::${AWS::AccountId}:role/LabRole"
+                  echo "SCHEDULER_GROUP=${ScheduleGroup}"
+                  echo "SCHEDULER_DLQ_ARN=${DlqArn}"
+                  echo "RESERVATION_HOLD_MINUTES=${ReservationHoldMinutes}"
+                } > /etc/savebite/env
+                unset DATABASE_URL
+                set -x
                 chown root:savebite /etc/savebite/env
                 chmod 640 /etc/savebite/env
 
@@ -236,6 +276,17 @@ Resources:
                 done
                 signal 1
               - ArtifactBucket: !ImportValue { "Fn::Sub": "${BaseStackName}-ArtifactBucket" }
+                DbSecretArn: !GetAtt Database.MasterUserSecret.SecretArn
+                DbHost: !GetAtt Database.Endpoint.Address
+                DbPort: !GetAtt Database.Endpoint.Port
+                RedisHost: !GetAtt RedisCluster.RedisEndpoint.Address
+                RedisPort: !GetAtt RedisCluster.RedisEndpoint.Port
+                UserPoolId: !ImportValue { "Fn::Sub": "${BaseStackName}-UserPoolId" }
+                UserPoolClientId: !ImportValue { "Fn::Sub": "${BaseStackName}-UserPoolClientId" }
+                PhotoBucket: !ImportValue { "Fn::Sub": "${BaseStackName}-PhotoBucket" }
+                TopicArn: !ImportValue { "Fn::Sub": "${BaseStackName}-NewListingTopicArn" }
+                ScheduleGroup: !ImportValue { "Fn::Sub": "${BaseStackName}-ScheduleGroup" }
+                DlqArn: !ImportValue { "Fn::Sub": "${BaseStackName}-DlqArn" }
 
   AppAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
@@ -250,7 +301,8 @@ Resources:
         MaxBatchSize: 1
         PauseTime: PT15M
         WaitOnResourceSignals: true
-    DependsOn: [AppRouteA, AppRouteB]   # 開機時要經 NAT 安裝套件
+    # 開機時要經 NAT 安裝套件，並經 VPC endpoint 讀 Secrets Manager
+    DependsOn: [AppRouteA, AppRouteB, SecretsManagerEndpoint]
     Properties:
       AutoScalingGroupName: savebite-app-asg
       MinSize: "2"                      # 固定 2 台：目的是容錯，不做擴展（§4.2）
@@ -268,6 +320,224 @@ Resources:
       Tags:
         - { Key: project, Value: savebite, PropagateAtLaunch: true }
 
+  # ======================================================================
+  # 第二段：RDS、ElastiCache、Secrets Manager endpoint、Lambda
+  # ======================================================================
+
+  # ---------- RDS PostgreSQL ----------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: savebite-db-subnets
+      DBSubnetGroupDescription: SaveBite RDS in private data subnets
+      SubnetIds:
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-DataSubnetA" }
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-DataSubnetB" }
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    # 測試環境：刪除 stack 時不留快照（預設會留快照並持續收費）
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: savebite-db
+      Engine: postgres
+      EngineVersion: "16.13"            # 2026-11-27 查到的 PostgreSQL 16 預設小版本（只寫 "16" 不能建立新執行個體）
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: savebite
+      MasterUsername: savebite_admin
+      ManageMasterUserPassword: true    # 密碼由 RDS 產生並存進 Secrets Manager，不經過我們的手
+      MultiAZ: !Ref RdsMultiAz
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-DbSg" }
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      MonitoringInterval: 0             # Learner Lab 不支援 Enhanced monitoring
+      EnablePerformanceInsights: false
+      DeletionProtection: false
+      AutoMinorVersionUpgrade: true
+      Tags: [{ Key: Name, Value: savebite-db }]
+
+  # ---------- ElastiCache Redis（開發用單一節點） ----------
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: savebite-redis-subnets
+      Description: SaveBite Redis in private data subnets
+      SubnetIds:
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-DataSubnetA" }
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-DataSubnetB" }
+
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      ClusterName: savebite-redis
+      Engine: redis
+      EngineVersion: "7.1"
+      CacheNodeType: !Ref CacheNodeType
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      VpcSecurityGroupIds:
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-RedisSg" }
+      Tags: [{ Key: Name, Value: savebite-redis }]
+
+  # ---------- Secrets Manager interface endpoint ----------
+  # Lambda 在資料子網路，沒有對外路由，要靠這個 endpoint 讀 RDS 密碼。
+  # 開啟 Private DNS 後，整個 VPC（包含 EC2）呼叫 Secrets Manager 都會走這裡。
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: endpoint-sg
+      GroupDescription: Interface VPC endpoints - HTTPS from app-sg and lambda-sg
+      VpcId: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !ImportValue { "Fn::Sub": "${NetworkStackName}-AppSg" }
+          Description: HTTPS from EC2
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !ImportValue { "Fn::Sub": "${NetworkStackName}-LambdaSg" }
+          Description: HTTPS from Lambda
+      Tags: [{ Key: Name, Value: endpoint-sg }]
+
+  # lambda-sg 原本只能連 DB 與 Redis，這裡加上連 endpoint 的 443（隨 runtime stack 一起刪除）
+  LambdaToEndpointEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !ImportValue { "Fn::Sub": "${NetworkStackName}-LambdaSg" }
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref EndpointSecurityGroup
+      Description: HTTPS to interface VPC endpoints
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !ImportValue { "Fn::Sub": "${NetworkStackName}-VpcId" }
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-DataSubnetA" }
+        - !ImportValue { "Fn::Sub": "${NetworkStackName}-DataSubnetB" }
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # ---------- Lambda：逾時釋出、到期下架、安全網掃描 ----------
+  ReleaseLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: /aws/lambda/savebite-release
+      RetentionInDays: 7
+
+  ReleaseFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [ReleaseLogGroup, LambdaToEndpointEgress]
+    Properties:
+      FunctionName: savebite-release
+      Description: SaveBite release/expire/sweep (placeholder until the real code is deployed)
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue { "Fn::Sub": "${NetworkStackName}-DataSubnetA" }
+          - !ImportValue { "Fn::Sub": "${NetworkStackName}-DataSubnetB" }
+        SecurityGroupIds:
+          - !ImportValue { "Fn::Sub": "${NetworkStackName}-LambdaSg" }
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt Database.Endpoint.Address
+          DB_PORT: !GetAtt Database.Endpoint.Port
+          DB_NAME: savebite
+          DB_SECRET_ARN: !GetAtt Database.MasterUserSecret.SecretArn
+          REDIS_HOST: !GetAtt RedisCluster.RedisEndpoint.Address
+          REDIS_PORT: !GetAtt RedisCluster.RedisEndpoint.Port
+      Code:
+        # 佔位程式：只驗證網路與權限（DB、Redis 的 TCP 連線、Secrets Manager 讀取），不改任何資料。
+        # 正式的釋出邏輯（ARCHITECTURE.md §6.3）由 A 組員實作後取代。
+        ZipFile: |
+          """佔位用的 Lambda：只驗證網路與權限，正式的釋出邏輯由 A 組員實作後取代。"""
+          import json
+          import os
+          import socket
+          import time
+
+          import boto3
+          from botocore.config import Config
+
+
+          def _tcp(host, port):
+              start = time.time()
+              try:
+                  with socket.create_connection((host, int(port)), timeout=3):
+                      return {"ok": True, "ms": round((time.time() - start) * 1000)}
+              except OSError as exc:
+                  return {"ok": False, "error": repr(exc)}
+
+
+          def handler(event, context):
+              result = {
+                  "event": event,
+                  "db": _tcp(os.environ["DB_HOST"], os.environ["DB_PORT"]),
+                  "redis": _tcp(os.environ["REDIS_HOST"], os.environ["REDIS_PORT"]),
+              }
+              try:
+                  sm = boto3.client(
+                      "secretsmanager",
+                      config=Config(connect_timeout=3, read_timeout=5, retries={"max_attempts": 1}),
+                  )
+                  secret = json.loads(sm.get_secret_value(SecretId=os.environ["DB_SECRET_ARN"])["SecretString"])
+                  result["secretsmanager"] = {"ok": True, "has_password": bool(secret.get("password"))}
+              except Exception as exc:  # noqa: BLE001  佔位程式只回報結果
+                  result["secretsmanager"] = {"ok": False, "error": repr(exc)}
+              print(json.dumps(result, default=str))
+              return result
+
+  # 非同步呼叫（Scheduler、EventBridge rule）的重試與失敗目的地（已驗證的設定，見 CONSOLE_SETUP.md §7）
+  ReleaseEventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ReleaseFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 2
+      MaximumEventAgeInSeconds: 3600
+      DestinationConfig:
+        OnFailure:
+          Destination: !ImportValue { "Fn::Sub": "${BaseStackName}-DlqArn" }
+
+  # ---------- 安全網掃描：每 5 分鐘觸發一次（§6.3） ----------
+  # 用 EventBridge rule，靠 Lambda resource-based policy 觸發，不需要執行角色
+  SweepRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: savebite-sweep
+      Description: Trigger the release Lambda sweep every 5 minutes
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Id: release-lambda
+          Arn: !GetAtt ReleaseFunction.Arn
+          Input: '{"type": "sweep"}'
+
+  SweepRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReleaseFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SweepRule.Arn
+
 Outputs:
   AlbDnsName:
     Description: Open http://<this value>/health in a browser.
@@ -282,3 +552,15 @@ Outputs:
   AutoScalingGroupName:
     Value: !Ref AppAutoScalingGroup
     Export: { Name: !Sub "${AWS::StackName}-AsgName" }
+  DbEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+    Export: { Name: !Sub "${AWS::StackName}-DbEndpoint" }
+  DbSecretArn:
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+    Export: { Name: !Sub "${AWS::StackName}-DbSecretArn" }
+  RedisEndpoint:
+    Value: !GetAtt RedisCluster.RedisEndpoint.Address
+    Export: { Name: !Sub "${AWS::StackName}-RedisEndpoint" }
+  ReleaseLambdaArn:
+    Value: !GetAtt ReleaseFunction.Arn
+    Export: { Name: !Sub "${AWS::StackName}-ReleaseLambdaArn" }

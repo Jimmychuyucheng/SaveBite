@@ -21,7 +21,7 @@
 |---|---|---|---|
 | `savebite-network` | ✅ `CREATE_COMPLETE` | 2026-11-27 | $0 |
 | `savebite-base` | ✅ `UPDATE_COMPLETE`（11-27 新增 artifacts bucket） | 2026-11-27 | $0（Cognito Essentials 每月 1 萬名活躍使用者內免費） |
-| `savebite-runtime` | ⬜ 目前不存在。第一段已在 11-27 測試後刪除（見 §8） | | 第一段約 $0.13／小時 |
+| `savebite-runtime` | ⬜ 目前不存在。第一、二段已在 11-27 測試後刪除（見 §8） | | 第一加第二段約 $0.19／小時 |
 
 ## 2. savebite-network
 
@@ -140,6 +140,7 @@ aws cloudformation delete-stack --profile savebite-lab --region us-east-1 --stac
 | 2026-11-27 | 更新 `savebite-base`：新增 S3 部署檔 bucket `savebite-artifacts-126811246350`（其他資源不變） |
 | 2026-11-27 | 上傳 `releases/backend-a886d49fc215.tar.gz`（`main` 的 A1 骨架） |
 | 2026-11-27 | 建立 `savebite-runtime` 第一段（13:23:41–13:27:56 UTC），測試後刪除（13:31:46–13:34:54 UTC），共開約 11 分鐘，費用約 $0.03 |
+| 2026-11-27 | 建立 `savebite-runtime` 第一加第二段（14:29:42–14:43:08 UTC），測試後刪除（15:00:11–15:24:29 UTC），共約 55 分鐘，費用約 $0.18；殘留的 ElastiCache 網路介面與 RDS 自動備份快照在 15:28:54 前由 AWS 自動清除 |
 
 ## 7. Scheduler 與 Lambda 的設定方式（已驗證）
 
@@ -153,7 +154,11 @@ aws cloudformation delete-stack --profile savebite-lab --region us-east-1 --stac
 
 ## 8. savebite-runtime
 
-目前模板只有**第一段**：NAT Gateway、ALB、Launch Template、Auto Scaling group（EC2 × 2）。RDS、ElastiCache、Lambda 之後再加。**用完當天就刪除。**
+目前模板包含：
+- **第一段**：NAT Gateway、ALB、Launch Template、Auto Scaling group（EC2 × 2）
+- **第二段**：RDS PostgreSQL 16.13（密碼由 Secrets Manager 管理）、ElastiCache Redis 7.1、Secrets Manager interface endpoint、Lambda `savebite-release`（目前是佔位程式）、每 5 分鐘的 EventBridge rule `savebite-sweep`
+
+監控（第三段）之後再加。合計約 **$0.19／小時**，建立約 13 到 14 分鐘。**用完當天就刪除。**
 
 ### 部署步驟
 
@@ -194,14 +199,36 @@ aws cloudformation wait stack-delete-complete --profile savebite-lab --region us
 | `NatGatewayCount` | `1` | 實驗一、二改成 `2` |
 | `InstanceType` | `t3.small` | 可選 t3.micro／small／medium |
 | `AppEnv` | `dev` | 壓測時改成 `loadtest` |
-| `AppDatabaseUrl` | 連不到的佔位位址 | 第一段還沒有 RDS；第二段改成從 Secrets Manager 取得 |
+| `RdsMultiAz` | `false` | 實驗二（RDS 容錯移轉）改成 `true`，RDS 費用約加倍 |
+| `DbInstanceClass` | `db.t3.micro` | |
+| `CacheNodeType` | `cache.t3.micro` | |
+| `ReservationHoldMinutes` | `30` | 寫進 EC2 的 `RESERVATION_HOLD_MINUTES` |
+
+### 第二段資源
+
+| 資源 | 名稱 | 設定 |
+|---|---|---|
+| RDS | `savebite-db` | PostgreSQL 16.13、db.t3.micro、gp3 20 GB、加密、資料子網路、`db-sg`；主帳號 `savebite_admin`，資料庫 `savebite`；`ManageMasterUserPassword`（密碼存在 Secrets Manager）；備份保留 1 天；**刪除 stack 時不留快照** |
+| ElastiCache | `savebite-redis` | Redis 7.1、cache.t3.micro、單一節點、資料子網路、`redis-sg` |
+| Secrets Manager endpoint | | interface endpoint，資料子網路 A／B，Private DNS 開啟；SG `endpoint-sg`（只接受 `app-sg`、`lambda-sg` 的 443） |
+| `lambda-sg` 對外規則 | | runtime stack 加上 443 → `endpoint-sg`（隨 stack 一起刪除） |
+| Lambda | `savebite-release` | Python 3.12、LabRole、資料子網路、`lambda-sg`、逾時 30 秒；非同步重試 2 次、失敗送 `savebite-dlq`；log group 保留 7 天 |
+| EventBridge rule | `savebite-sweep` | `rate(5 minutes)`，payload `{"type": "sweep"}` |
+
+**為什麼要 Secrets Manager endpoint**：Lambda 在資料子網路，沒有對外路由，連不到 Secrets Manager 取得 DB 密碼。endpoint 約 $0.02／小時，只在 runtime 存在時計費。不把密碼放進 Lambda 環境變數，因為 Console 上看得到明文，而且 RDS 自動換密碼後就會失效。
+
+**Lambda 目前是佔位程式**：只測試 DB、Redis 的 TCP 連線和 Secrets Manager 讀取，不改任何資料。正式的釋出邏輯（ARCHITECTURE.md §6.3）由 A 組員實作後替換，重試、DLQ、觸發規則等設定可以沿用。
+
+**注意：RDS 管理的密碼預設每 7 天自動輪替一次。** EC2 只在開機時讀一次密碼，如果 runtime stack 開超過 7 天（不應該發生），密碼換掉後要重開 EC2。
 
 ### EC2 開機流程（user data）
 
 1. `dnf install python3.11 python3.11-pip aws-cfn-bootstrap`
 2. 從 artifacts bucket 下載打包檔，解壓到 `/opt/savebite/backend`，建立 venv 並安裝 `requirements.txt`
-3. 寫入 `/etc/savebite/env`（環境變數），建立 systemd 服務 `savebite`（uvicorn，port 8000）
-4. 本機 `/health` 回 200 後，用 `cfn-signal` 回報成功；任何一步失敗就回報失敗
+3. 從 Secrets Manager 取得 RDS 帳密（經 VPC endpoint），URL 編碼後組成 `DATABASE_URL`。這幾行關閉 `set -x`，所以密碼不會進日誌
+4. 寫入 `/etc/savebite/env`（權限 640，`root:savebite`），內容包含 `DATABASE_URL`、`REDIS_URL`、Cognito、S3、SNS、Lambda、Scheduler 等 13 個環境變數
+5. 建立 systemd 服務 `savebite`（uvicorn，port 8000）
+6. 本機 `/health` 回 200 後，用 `cfn-signal` 回報成功；任何一步失敗就回報失敗
 
 除錯：用 Session Manager 連進 EC2（Console → EC2 → 選機器 → Connect → Session Manager），查看：
 - 開機日誌：`sudo cat /var/log/savebite-userdata.log`
@@ -233,3 +260,29 @@ aws cloudformation wait stack-delete-complete --profile savebite-lab --region us
 - **服務沒有完全中斷**：受影響時間約 19 秒，期間部分請求失敗；整段 147 個請求中有 6 個失敗（4.1%）
 - **恢復成 2 台花了 2 分 17 秒**
 - 失敗集中在 ALB 還沒判定那台不健康的期間（健康檢查 10 秒一次、連續 2 次失敗才判定）
+
+### 2026-11-27 第二段測試結果
+
+建立：14:29:42–14:43:08 UTC（13 分 26 秒，主要在等 RDS）。
+
+| 項目 | 結果 |
+|---|---|
+| Learner Lab 支援度 | ✅ ElastiCache、RDS `ManageMasterUserPassword`、Secrets Manager interface endpoint 都能建立 |
+| ALB `/health` | ✅ 200 |
+| EC2 讀 Secrets Manager | ✅ 兩台開機時都取得密碼並組成 `DATABASE_URL`（經 VPC endpoint） |
+| EC2 → RDS | ✅ asyncpg 連線成功，`server_version` 16.13，`savebite_admin@savebite` |
+| EC2 → Redis | ✅ `PING` → `+PONG` |
+| 環境變數檔 | ✅ 13 個變數齊全，權限 `640 root:savebite`；開機日誌沒有出現密碼 |
+| **EC2 PassRole LabRole** | ✅ 在 EC2 上用 LabInstanceProfile 建立以 LabRole 為執行角色的排程成功；14:49:00 排定，14:49:11 觸發 Lambda，執行後自動刪除 |
+| Lambda（VPC 內） | ✅ 手動呼叫：連 DB 21 ms、連 Redis 10 ms、Secrets Manager 讀得到密碼 |
+| 安全網掃描 rule | ✅ 14:43、14:48、14:53、14:58 各觸發一次，間隔 5 分鐘 |
+| DLQ | 0 則（沒有失敗） |
+
+刪除：15:00:11–15:24:29 UTC（**24 分鐘**，比第一段久很多，主要在等 RDS 和 VPC 內 Lambda 的網路介面釋放）。
+
+刪除後檢查殘留：
+- RDS、ElastiCache、secret、interface endpoint、`endpoint-sg`、NAT、EIP、EC2、ALB、Lambda、log group 都已刪除；`lambda-sg` 的 443 規則也已移除
+- 剛刪完時還看得到 **ElastiCache 的網路介面**和 **RDS 自動備份快照**（`rds:savebite-db-...`，來自備份保留 1 天），兩者都由 AWS 非同步清除，約 4 分鐘後（15:28:54）都消失了，不需要手動處理
+- 從建立到刪除完成共約 55 分鐘，費用約 $0.18
+
+**下次刪除後如果還看到這兩樣**：先等 5 到 10 分鐘再查。ElastiCache 的網路介面沒消失前，`redis-sg` 還在使用中，這時刪除 network stack 會失敗。

@@ -42,7 +42,7 @@
 |---|---|---|---|
 | `savebite-network` | VPC、6 個子網路、IGW、路由表、S3 Gateway Endpoint、所有 Security Group | 免費 | 常駐 |
 | `savebite-base` | Cognito user pool 與 app client、S3 照片 bucket（含 CORS、Lifecycle）、S3 部署檔 bucket、SNS topic、SQS DLQ、Scheduler schedule group | 免費或幾乎免費 | 常駐 |
-| `savebite-runtime` | NAT Gateway、ALB、Auto Scaling（EC2）、RDS、ElastiCache、Lambda、安全網掃描的 EventBridge rule | 計費 | 用完就刪 |
+| `savebite-runtime` | NAT Gateway、ALB、Auto Scaling（EC2）、RDS、ElastiCache、Secrets Manager interface endpoint、Lambda、安全網掃描的 EventBridge rule | 計費 | 用完就刪 |
 
 `savebite-runtime` 參數：
 
@@ -62,6 +62,8 @@
 | EC2 t3.small | 每台約 $0.021 |
 | RDS db.t3.micro | 單一 AZ 約 $0.017；Multi-AZ 約 $0.034 |
 | ElastiCache cache.t3.micro | 約 $0.017 |
+| Secrets Manager interface endpoint | 每個 AZ 約 $0.01（兩個 AZ 約 $0.02） |
+| 合計（NAT 1 個、單一 AZ RDS） | 約 $0.19 |
 
 ---
 
@@ -74,6 +76,7 @@
                                  ├─→ RDS PostgreSQL（主：AZ-a；實驗時開 Multi-AZ，同步備援在 AZ-b）
                                  ├─↔ ElastiCache Redis（Pub/Sub）
                                  ├─→ S3 照片（經 S3 Gateway Endpoint）
+                                 ├─→ Secrets Manager（經 interface endpoint，讀 RDS 密碼）
                                  └─→ NAT Gateway ─→ Cognito、SNS、EventBridge Scheduler API、SSM
 
 瀏覽器 ─(presigned URL)─→ S3 照片（直傳、直讀）
@@ -94,6 +97,7 @@ EventBridge rule（每 5 分鐘，安全網掃描）─→ 同一個 Lambda
 | Internet Gateway | 外部流量進入 VPC |
 | NAT Gateway | 預設 1 個（AZ-a），實驗時每個 AZ 各一個（`NatGatewayCount`）；私有應用子網路經此呼叫 Cognito、SNS、EventBridge Scheduler API、Systems Manager |
 | S3 Gateway Endpoint | 私有子網路直連 S3，不經 NAT |
+| Secrets Manager interface endpoint | 放在資料子網路 A／B，Private DNS 開啟（runtime stack）。Lambda 在資料子網路沒有對外路由，靠它讀 RDS 密碼；EC2 呼叫 Secrets Manager 也會走這裡。SG `endpoint-sg` 只接受 `app-sg`、`lambda-sg` 的 443 |
 
 路由表：
 - 公有：`0.0.0.0/0 → IGW`
@@ -131,7 +135,10 @@ EventBridge rule（每 5 分鐘，安全網掃描）─→ 同一個 Lambda
 | `app-sg` | 8000（FastAPI） | 只限 `alb-sg` |
 | `db-sg` | 5432 | 只限 `app-sg`、`lambda-sg` |
 | `redis-sg` | 6379 | 只限 `app-sg`、`lambda-sg` |
-| `lambda-sg` | 不開放進入 | 只對外連 DB、Redis |
+| `lambda-sg` | 不開放進入 | 只對外連 DB、Redis，以及 443 → `endpoint-sg`（runtime stack 加上） |
+| `endpoint-sg` | 443 | 只限 `app-sg`、`lambda-sg`（runtime stack 建立） |
+
+RDS 密碼由 RDS 產生並存在 Secrets Manager（`ManageMasterUserPassword`），不經過 CloudFormation 參數或程式碼。EC2 開機時讀取並寫進權限 640 的環境變數檔；Lambda 執行時讀取（建議在冷啟動時讀一次並快取）。RDS 管理的密碼預設每 7 天輪替，runtime stack 本來就不會開那麼久。
 
 ---
 
@@ -580,7 +587,7 @@ docs/                     本文件、CONSOLE_SETUP.md
 - ~~**EventBridge Scheduler + LabRole**~~ ✅ **2026-11-27 已驗證可用**
   - LabRole 的 trust policy 包含 `scheduler.amazonaws.com`（也包含 `events.amazonaws.com`）
   - 用 voclabs 身分建立以 LabRole 為執行角色的排程：成功，排程也確實觸發了 Lambda
-  - **還沒驗證**：EC2（LabInstanceProfile）呼叫 `CreateSchedule` 時能否 `iam:PassRole` LabRole，要等 runtime stack 建好，在 EC2 上測
+  - ✅ **2026-11-27 已驗證**：EC2（LabInstanceProfile）呼叫 `CreateSchedule` 時可以 `iam:PassRole` LabRole；排程依時觸發 Lambda（晚 11 秒），執行完自動刪除
   - 不需要走退路；安全網掃描照樣保留，用來補救
 - ~~**重試由哪一層負責**~~ ✅ **2026-11-27 已驗證**：由 **Lambda 的非同步重試**負責，結論已寫進 6.3
   - 方法：測試 Lambda 設非同步 `MaximumRetryAttempts=2`，失敗目的地是 `savebite-dlq`；排程設 retry 2 次、DLQ 也是 `savebite-dlq`。兩個排程在同一時間觸發：`fail-once` 第一次丟例外、之後成功；`fail-always` 每次都丟例外。從 CloudWatch Logs 計算執行次數、間隔和 request ID
@@ -591,6 +598,12 @@ docs/                     本文件、CONSOLE_SETUP.md
 - ✅ **runtime 第一段（2026-11-27 已驗證）**：NAT、ALB、Auto Scaling（EC2 × 2，LabInstanceProfile）都能用 CloudFormation 建立
   - EC2 經 NAT 對外連線正常；Systems Manager（Run Command）可以連到私有子網路的 EC2
   - 終止一台 EC2：服務沒有完全中斷，約 19 秒內部分請求失敗（147 個中 6 個），2 分 17 秒後恢復成 2 台。詳細數據見 CONSOLE_SETUP.md §8
-- **ElastiCache**：Learner Lab 實際建立時是否可用
+- ✅ **runtime 第二段（2026-11-27 已驗證）**：
+  - Learner Lab 可以建立 ElastiCache（Redis 7.1）、RDS 的 `ManageMasterUserPassword`、Secrets Manager interface endpoint
+  - EC2 經 endpoint 讀到 RDS 密碼，用 asyncpg 連上 RDS、對 Redis PING 成功
+  - VPC 內的 Lambda 連得到 DB、Redis、Secrets Manager
+  - 每 5 分鐘的安全網掃描 rule 準時觸發
+  - 詳細數據見 CONSOLE_SETUP.md §8
+- ~~**ElastiCache**：Learner Lab 實際建立時是否可用~~ ✅ 可用（見上）
 - **只有 HTTP**：Learner Lab 不能註冊網域，ALB 沒有正式憑證，只能用 HTTP，登入密碼以明文傳輸。課程專案可接受，報告中要列為已知限制
 - 預約保留時間（目前預設 30 分鐘）、每人每次預約上限、未登入輪詢間隔、WebSocket 訂閱格子上限

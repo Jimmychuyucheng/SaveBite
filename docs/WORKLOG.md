@@ -74,7 +74,9 @@
 | 11-27 | 組長負責 C（網路與基礎設施）；A1 骨架屬於 B 的範圍、A2 migration 屬於 A 的範圍，A2 先暫停，交給 A | 避免做到別人的範圍；ARCHITECTURE.md 中 A、B 負責的部分請他們確認 |
 | 11-27 | runtime stack 可以分段建立測試，但當天刪除（CLAUDE.md 規則已改） | 不必等程式全部寫好，就能先驗證 NAT、ALB、Auto Scaling |
 | 11-27 | 程式碼用「打包上傳 S3」部署到 EC2，不用開機 `git clone` | 版本固定、對得到 commit，兩台不會跑不同版本 |
-| 11-27 | RDS 密碼用 Secrets Manager（`ManageMasterUserPassword`）；EC2 t3.small、RDS db.t3.micro；ElastiCache 開發時單一節點 | 第二段實作時採用；EC2 能否讀 Secrets Manager 要實測 |
+| 11-27 | RDS 密碼用 Secrets Manager（`ManageMasterUserPassword`）；EC2 t3.small、RDS db.t3.micro；ElastiCache 開發時單一節點 | 第二段實作時採用；已實測可用 |
+| 11-27 | 加上 Secrets Manager interface endpoint（runtime stack） | Lambda 在資料子網路沒有對外路由；不把密碼放進環境變數 |
+| 11-27 | 測試通過後由 Claude 自己 squash and merge 並繼續；AWS 建立／刪除仍要先同意 | 組長授權；放寬 AWS 審核的部分被權限系統擋下 |
 
 ---
 
@@ -115,6 +117,20 @@
   - 測試完當天刪除：前後共開約 11 分鐘，費用約 $0.03
 - 第一段還沒有 RDS，`DATABASE_URL` 指向連不到的位址；程式照樣啟動，`/health` 回 200，剛好也驗證了 §6.7 的設計
 
+### 2026-11-27 runtime 第二段（`infra/runtime-data`）
+- **runtime.yaml 新增**：
+  - RDS PostgreSQL 16.13：密碼由 RDS 產生並存進 Secrets Manager；刪除 stack 時不留快照
+  - ElastiCache Redis 7.1：單一節點
+  - Secrets Manager interface endpoint 與 `endpoint-sg`
+  - Lambda `savebite-release`：佔位程式；非同步重試 2 次、失敗送 DLQ
+  - EventBridge rule `savebite-sweep`：每 5 分鐘觸發一次
+- **EC2 user data**：從 Secrets Manager 取得密碼組成 `DATABASE_URL`，並寫入 13 個環境變數。取得密碼的那幾行關閉 `set -x`，避免密碼進日誌；移除第一段的 `AppDatabaseUrl` 參數
+- **設計調整**：Lambda 在資料子網路沒有對外路由，連不到 Secrets Manager，所以加上 interface endpoint（約 $0.02／小時）。沒有把密碼放進 Lambda 環境變數，因為 Console 上看得到明文，而且輪替後會失效
+- `cfn-lint` 指出 `EngineVersion: "16"` 不能用來建立新的 RDS，改成固定 `16.13`
+- **規則**：
+  - 使用者授權「測試通過後自己 squash and merge 並繼續」，已寫進 CLAUDE.md
+  - 「AWS 建立／刪除不用先問」這一項被權限系統擋下，維持「建立前先列出資源與費用、等同意」
+
 ---
 
 ## 4. 驗證與實驗
@@ -154,6 +170,19 @@
 - 小插曲：探測腳本跑到 13:31:29 就停了（應該跑 8 分鐘），推測是背景 shell 結束時被一起關掉；這時已經涵蓋到恢復完成，不影響結論。正式實驗要改用不會被中斷的方式（例如 k6 或 `nohup`）
 - 結果寫進 CONSOLE_SETUP.md §8、ARCHITECTURE.md §11
 
+### 2026-11-27 runtime 第二段測試 ✅
+- 建立花 13 分 26 秒。**ElastiCache、RDS 管理的密碼、Secrets Manager interface endpoint 在 Learner Lab 都能用**
+- ALB `/health` 回 200
+- 兩台 EC2：經 endpoint 讀到密碼；asyncpg 連上 RDS（16.13，`savebite_admin@savebite`）；Redis 回 `PONG`；環境變數檔權限 640；開機日誌沒有密碼
+- **EC2 可以 PassRole LabRole**：在 EC2 上建立排程成功，14:49:00 排定、14:49:11 觸發 Lambda，執行完自動刪除
+- Lambda（VPC 內）：連 DB 21 ms、連 Redis 10 ms，Secrets Manager 讀得到密碼
+- 安全網掃描 rule：14:43、14:48、14:53、14:58 各觸發一次
+- DLQ 0 則
+- 測試途中 zsh 不會拆開變數裡的參數，SSM 指令第一次沒送出去；改成 bash 腳本後重跑成功
+- **刪除花了 24 分鐘**（RDS 和 Lambda 的網路介面）。剛刪完時還有 ElastiCache 的網路介面和 RDS 自動備份快照，約 4 分鐘後由 AWS 自動清除
+- 從建立到刪除完成約 55 分鐘，費用約 $0.18
+- 結果寫進 CONSOLE_SETUP.md §8、ARCHITECTURE.md §4、§11
+
 ---
 
 ## 5. Git 與工作流程
@@ -171,7 +200,8 @@
 | 11-27 | 模板註解改成中文 | `chore/zh-comments` → [PR #2](https://github.com/Jimmychuyucheng/SaveBite/pull/2) |
 | 11-27 | 合併 PR #1、#2（用 merge commit；之後建議改用 squash） | `e9586fe`、`b74fbe6` |
 | 11-27 | A1 本機開發骨架 | `feat/backend-skeleton` → PR #3（squash 合併 `a886d49`） |
-| 11-27 | runtime 第一段 | `infra/runtime-compute` |
+| 11-27 | runtime 第一段 | `infra/runtime-compute` → PR #4（squash 合併 `38b7aa8`） |
+| 11-27 | runtime 第二段 | `infra/runtime-data` |
 
 ---
 
@@ -214,9 +244,11 @@
 - [ ] 通知 A、B：ARCHITECTURE.md 中他們負責的部分（§6.1–6.4、§6.9）請確認；A1 骨架交給 B 接手
 - [ ] A2 資料表 migration（**A 組員**負責）
 - [x] runtime 第一段：NAT、ALB、Auto Scaling（已測試並刪除）
-- [ ] runtime 第二段：RDS（Secrets Manager 密碼）、ElastiCache、Lambda、安全網掃描 EventBridge rule
-- [ ] 監控：CloudWatch agent（應用日誌）、告警（ALB 5xx、UnHealthyHostCount、RDS、DLQ）、dashboard
+- [x] runtime 第二段：RDS（Secrets Manager 密碼）、ElastiCache、Lambda、安全網掃描 EventBridge rule（已測試並刪除）
+- [x] 待驗證：ElastiCache 在 Lab 能否建立、EC2 能否 PassRole LabRole、EC2 能否讀 Secrets Manager（全部可以）
+- [ ] 監控（第三段）：CloudWatch agent（應用日誌）、告警（ALB 5xx、UnHealthyHostCount、RDS、DLQ）、dashboard
 - [ ] 部署與刪除 runtime 的腳本
-- [ ] 待驗證：ElastiCache 在 Lab 能否建立、EC2 能否 PassRole LabRole、EC2 能否讀 Secrets Manager
+- [ ] Lambda 正式程式（**A 組員**）：替換 `savebite-release` 的佔位程式，沿用現有的重試、DLQ、觸發設定
+- [ ] 應用程式改用非主帳號連 DB（目前用 RDS 主帳號 `savebite_admin`），和 A 討論 migration 時一起處理
 - [ ] runtime 建好後：S3 CORS 改成只允許 ALB 網址和 localhost
 - [ ] 實驗一（`NatGatewayCount=2`，配合 A 的 k6 腳本）
