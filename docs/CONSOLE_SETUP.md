@@ -135,3 +135,14 @@ aws cloudformation delete-stack --profile savebite-lab --region us-east-1 --stac
 |---|---|
 | 2026-11-27 | 建立 `savebite-network`、`savebite-base` |
 | 2026-11-27 | 刪除測試用 user pool `User pool - rrletp`（`us-east-1_c1v2XzVOL`），先刪掉它的 domain、關閉刪除保護才刪除 |
+| 2026-11-27 | Scheduler + LabRole 驗證：暫時建立 Lambda `savebite-scheduler-test` 和排程 `test-fail-once`、`test-fail-always`（group `savebite`），驗證後全部刪除（Lambda、log group、S3 `test/` 下的 marker），並清空 `savebite-dlq`。結果見 ARCHITECTURE.md §11 |
+
+## 7. Scheduler 與 Lambda 的設定方式（已驗證）
+
+之後在 runtime stack 和後端程式要沿用這些設定：
+
+- Scheduler 執行角色：`arn:aws:iam::126811246350:role/LabRole`
+- 一次性排程：`ScheduleExpression=at(yyyy-mm-ddThh:mm:ss)`、`ScheduleExpressionTimezone=UTC`、`FlexibleTimeWindow={Mode: OFF}`、`ActionAfterCompletion=DELETE`、`GroupName=savebite`
+- 排程 target：`RetryPolicy={MaximumRetryAttempts: 2, MaximumEventAgeInSeconds: 3600}`、`DeadLetterConfig={Arn: <savebite-dlq ARN>}`
+- Lambda 非同步設定（`PutFunctionEventInvokeConfig`）：`MaximumRetryAttempts=2`、`MaximumEventAgeInSeconds=3600`、`DestinationConfig.OnFailure.Destination=<savebite-dlq ARN>`
+- 函式錯誤由 Lambda 的非同步重試處理，Scheduler 的 retry 只處理投遞失敗
