@@ -69,6 +69,8 @@
 | 11-27 | 之後一律用 branch 和 PR | 由組長確認後才合併 |
 | 11-27 | WORKLOG.md 放進 repo（和驗證結果同一個 PR） | 組長可以回顧，組員也看得到進度 |
 | 11-27 | 不走 Scheduler 的退路，個別排程照原設計 | 實測 Scheduler + LabRole 可用 |
+| 11-27 | 回覆、文件、註解、commit、PR、留言一律用繁體中文；識別字和資源名稱用英文 | 組長要求 |
+| 11-27 | CloudFormation 的 `Description`、SG 的 `GroupDescription` 維持英文 | 實測中文會被換成「?」；SG 描述只能用 ASCII，而且修改會讓 SG 重建 |
 
 ---
 
@@ -87,6 +89,11 @@
 - 兩個都 `CREATE_COMPLETE`，費用 $0
 - Cognito 預設建成 Essentials 方案（每月 1 萬名活躍使用者內免費）
 - 抽查：S3 endpoint 是 available；`lambda-sg` 只能對外連 DB、Redis
+
+### 2026-11-27 模板註解改成中文（PR #2）
+- `#` 註解改成繁體中文
+- 發現 CloudFormation 會把模板 `Description` 裡的中文換成 `?`（AWS CLI、boto3 都一樣，跟 locale 無關），所以 `Description` 維持英文
+- 用 cfn-lint 的解析器比對新舊模板，內容完全相同，不需要更新 stack
 
 ### 2026-11-27 刪除測試 user pool `User pool - rrletp`
 - 它開了刪除保護、掛著 domain，所以先刪 domain、關掉保護，再刪除 pool
@@ -129,7 +136,10 @@
 | 11-27 | commit 模板和 CONSOLE_SETUP.md | `a86d665` |
 | 11-27 | 推送到 main（branch 規則訂下之前） | `d5a7833..a86d665` |
 | 11-27 | 開始用 branch 開發 | `docs/scheduler-verification` |
-| 11-27 | commit 驗證結果和 WORKLOG.md（PR 待開） | `docs/scheduler-verification` |
+| 11-27 | commit 驗證結果和 WORKLOG.md，開 PR | `docs/scheduler-verification` → [PR #1](https://github.com/Jimmychuyucheng/SaveBite/pull/1) |
+| 11-27 | 規定所有文字一律用繁體中文；PR #1 的標題、描述、commit 訊息改成中文（commit 改寫後用 `--force-with-lease` 推送） | `9824e28` |
+| 11-27 | main 上已有的兩個英文 commit（`be6c758`、`a86d665`）不改寫，避免對 main 強制推送 | |
+| 11-27 | 模板註解改成中文 | `chore/zh-comments` → [PR #2](https://github.com/Jimmychuyucheng/SaveBite/pull/2) |
 
 ---
 
@@ -146,7 +156,8 @@
 
 - [x] 完成 Scheduler 驗證，把結果寫回 ARCHITECTURE.md §6.3、§11 和 CONSOLE_SETUP.md
 - [x] 刪除 Scheduler 驗證的暫時資源
-- [ ] 推送 `docs/scheduler-verification` 並開 PR（含 WORKLOG.md），等組長確認後合併
+- [x] 推送 `docs/scheduler-verification` 並開 PR（含 WORKLOG.md）
+- [ ] 組長確認並合併 PR #1（驗證結果與工作紀錄）、PR #2（模板中文註解）
 - [ ] A1 本機開發骨架
 - [ ] A2 資料表 migration
 - [ ] runtime stack 建好後：S3 CORS 改成只允許 ALB 網址和 localhost；測試 EC2 能否 PassRole LabRole
