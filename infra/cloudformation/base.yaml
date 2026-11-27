@@ -1,0 +1,156 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SaveBite base stack (free or near-free, long-lived): Cognito user pool and
+  public app client, S3 photo bucket, SNS topic for new-listing emails,
+  SQS dead-letter queue, and the EventBridge Scheduler schedule group.
+
+Parameters:
+  PhotoCorsOrigins:
+    Type: CommaDelimitedList
+    Default: "*"
+    Description: >
+      Allowed origins for browser PUT/GET to the photo bucket. Use "*" during
+      development; once the runtime stack exists, change to
+      http://<ALB DNS>,http://localhost:5173,http://localhost:8000
+  PhotoRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+
+Resources:
+  # ---------- Cognito ----------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: savebite-users
+      UsernameAttributes: [email]          # sign in with email
+      AutoVerifiedAttributes: [email]      # email verification code on sign-up
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false    # self sign-up enabled
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireUppercase: false
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT   # ~50 emails/day limit
+      MfaConfiguration: "OFF"
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: savebite-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false                # public client: no SECRET_HASH needed
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # ---------- S3 photos ----------
+  PhotoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub savebite-photos-${AWS::AccountId}
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT, GET]
+            AllowedOrigins: !Ref PhotoCorsOrigins
+            AllowedHeaders: ["*"]
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-photos
+            Status: Enabled
+            Prefix: photos/
+            ExpirationInDays: !Ref PhotoRetentionDays
+          - Id: abort-incomplete-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  # ---------- SNS ----------
+  NewListingTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: savebite-new-listings
+      DisplayName: SaveBite
+
+  # ---------- SQS DLQ ----------
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: savebite-dlq
+      MessageRetentionPeriod: 1209600   # 14 days
+
+  # ---------- EventBridge Scheduler ----------
+  ScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: savebite
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+    Export: { Name: !Sub "${AWS::StackName}-UserPoolId" }
+  UserPoolArn:
+    Value: !GetAtt UserPool.Arn
+    Export: { Name: !Sub "${AWS::StackName}-UserPoolArn" }
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+    Export: { Name: !Sub "${AWS::StackName}-UserPoolClientId" }
+  PhotoBucketName:
+    Value: !Ref PhotoBucket
+    Export: { Name: !Sub "${AWS::StackName}-PhotoBucket" }
+  PhotoBucketArn:
+    Value: !GetAtt PhotoBucket.Arn
+    Export: { Name: !Sub "${AWS::StackName}-PhotoBucketArn" }
+  NewListingTopicArn:
+    Value: !Ref NewListingTopic
+    Export: { Name: !Sub "${AWS::StackName}-NewListingTopicArn" }
+  DeadLetterQueueArn:
+    Value: !GetAtt DeadLetterQueue.Arn
+    Export: { Name: !Sub "${AWS::StackName}-DlqArn" }
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue
+    Export: { Name: !Sub "${AWS::StackName}-DlqUrl" }
+  ScheduleGroupName:
+    Value: !Ref ScheduleGroup
+    Export: { Name: !Sub "${AWS::StackName}-ScheduleGroup" }

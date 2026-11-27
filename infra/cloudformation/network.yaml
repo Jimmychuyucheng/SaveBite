@@ -1,0 +1,332 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SaveBite network stack (free resources only): VPC across two AZs, six subnets,
+  Internet Gateway, route tables, S3 Gateway Endpoint, and all security groups.
+  NAT Gateways and their routes are added by the savebite-runtime stack.
+
+Parameters:
+  AzA:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+  AzB:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1b
+
+Resources:
+  # ---------- VPC & Internet Gateway ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true   # needed for SSM and VPC endpoints
+      Tags: [{ Key: Name, Value: savebite-vpc }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: savebite-igw }]
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------- Subnets ----------
+  # Public: ALB, NAT. No auto-assigned public IPs (public IPv4 is billed).
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Ref AzA
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: savebite-public-a }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Ref AzB
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: savebite-public-b }]
+
+  # Private app: EC2.
+  AppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Ref AzA
+      CidrBlock: 10.0.11.0/24
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: savebite-app-a }]
+
+  AppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Ref AzB
+      CidrBlock: 10.0.12.0/24
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: savebite-app-b }]
+
+  # Private data: RDS, ElastiCache, Lambda.
+  DataSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Ref AzA
+      CidrBlock: 10.0.21.0/24
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: savebite-data-a }]
+
+  DataSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Ref AzB
+      CidrBlock: 10.0.22.0/24
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: savebite-data-b }]
+
+  # ---------- Route tables ----------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: savebite-rt-public }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # App route tables: 0.0.0.0/0 -> NAT is added by the runtime stack.
+  AppRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: savebite-rt-app-a }]
+
+  AppRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: savebite-rt-app-b }]
+
+  AppSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnetA
+      RouteTableId: !Ref AppRouteTableA
+
+  AppSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnetB
+      RouteTableId: !Ref AppRouteTableB
+
+  # Data route tables: local + S3 endpoint only, no internet route.
+  DataRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: savebite-rt-data-a }]
+
+  DataRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: savebite-rt-data-b }]
+
+  DataSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnetA
+      RouteTableId: !Ref DataRouteTableA
+
+  DataSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DataSubnetB
+      RouteTableId: !Ref DataRouteTableB
+
+  # ---------- S3 Gateway Endpoint (free) ----------
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds:
+        - !Ref AppRouteTableA
+        - !Ref AppRouteTableB
+        - !Ref DataRouteTableA
+        - !Ref DataRouteTableB
+
+  # ---------- Security groups ----------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: alb-sg
+      GroupDescription: ALB - HTTP 80 from anywhere (no certificate, so no 443)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from internet
+      Tags: [{ Key: Name, Value: alb-sg }]
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: app-sg
+      GroupDescription: EC2 FastAPI - port 8000 from ALB only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: FastAPI from ALB
+      Tags: [{ Key: Name, Value: app-sg }]
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: lambda-sg
+      GroupDescription: Lambda - no inbound; outbound only to DB and Redis
+      VpcId: !Ref Vpc
+      # Specifying an egress rule removes the default allow-all egress.
+      # This placeholder matches nothing; real egress rules are added below.
+      SecurityGroupEgress:
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 127.0.0.1/32
+          Description: Placeholder to remove default allow-all egress
+      Tags: [{ Key: Name, Value: lambda-sg }]
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: db-sg
+      GroupDescription: RDS PostgreSQL - 5432 from app-sg and lambda-sg only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: PostgreSQL from EC2
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: PostgreSQL from Lambda
+      Tags: [{ Key: Name, Value: db-sg }]
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: redis-sg
+      GroupDescription: ElastiCache Redis - 6379 from app-sg and lambda-sg only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: Redis from EC2
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: Redis from Lambda
+      Tags: [{ Key: Name, Value: redis-sg }]
+
+  LambdaToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+      Description: PostgreSQL to RDS
+
+  LambdaToRedisEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      DestinationSecurityGroupId: !Ref RedisSecurityGroup
+      Description: Redis to ElastiCache
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub "${AWS::StackName}-VpcId" }
+  VpcCidr:
+    Value: !GetAtt Vpc.CidrBlock
+    Export: { Name: !Sub "${AWS::StackName}-VpcCidr" }
+  PublicSubnetA:
+    Value: !Ref PublicSubnetA
+    Export: { Name: !Sub "${AWS::StackName}-PublicSubnetA" }
+  PublicSubnetB:
+    Value: !Ref PublicSubnetB
+    Export: { Name: !Sub "${AWS::StackName}-PublicSubnetB" }
+  AppSubnetA:
+    Value: !Ref AppSubnetA
+    Export: { Name: !Sub "${AWS::StackName}-AppSubnetA" }
+  AppSubnetB:
+    Value: !Ref AppSubnetB
+    Export: { Name: !Sub "${AWS::StackName}-AppSubnetB" }
+  DataSubnetA:
+    Value: !Ref DataSubnetA
+    Export: { Name: !Sub "${AWS::StackName}-DataSubnetA" }
+  DataSubnetB:
+    Value: !Ref DataSubnetB
+    Export: { Name: !Sub "${AWS::StackName}-DataSubnetB" }
+  AppRouteTableA:
+    Value: !Ref AppRouteTableA
+    Export: { Name: !Sub "${AWS::StackName}-AppRouteTableA" }
+  AppRouteTableB:
+    Value: !Ref AppRouteTableB
+    Export: { Name: !Sub "${AWS::StackName}-AppRouteTableB" }
+  AlbSecurityGroup:
+    Value: !Ref AlbSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-AlbSg" }
+  AppSecurityGroup:
+    Value: !Ref AppSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-AppSg" }
+  LambdaSecurityGroup:
+    Value: !Ref LambdaSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-LambdaSg" }
+  DbSecurityGroup:
+    Value: !Ref DbSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-DbSg" }
+  RedisSecurityGroup:
+    Value: !Ref RedisSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-RedisSg" }
