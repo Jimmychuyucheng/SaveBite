@@ -1,0 +1,36 @@
+# ---------- 設定與機密 ----------
+.env
+.env.*
+!.env.example
+*.pem
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# ---------- Node／前端 ----------
+node_modules/
+frontend/dist/
+npm-debug.log*
+
+# ---------- Lambda 打包產物 ----------
+lambda/**/build/
+lambda/**/package/
+*.zip
+
+# ---------- 壓測結果 ----------
+load-tests/results/
+
+# ---------- 編輯器與系統檔 ----------
+.DS_Store
+.idea/
+.vscode/
+*.swp

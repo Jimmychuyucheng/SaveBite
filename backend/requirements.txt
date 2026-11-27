@@ -1,0 +1,5 @@
+# 執行用套件（版本固定；EC2 上用 pip install -r 安裝）
+fastapi==0.165.0
+uvicorn[standard]==0.54.0   # [standard] 內含 WebSocket 支援
+pydantic-settings==2.16.3   # 用型別讀取環境變數
+asyncpg==0.32.0             # asyncio 版 PostgreSQL 驅動，直接寫 SQL

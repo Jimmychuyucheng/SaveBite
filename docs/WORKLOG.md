@@ -140,14 +140,36 @@
 | 11-27 | 規定所有文字一律用繁體中文；PR #1 的標題、描述、commit 訊息改成中文（commit 改寫後用 `--force-with-lease` 推送） | `9824e28` |
 | 11-27 | main 上已有的兩個英文 commit（`be6c758`、`a86d665`）不改寫，避免對 main 強制推送 | |
 | 11-27 | 模板註解改成中文 | `chore/zh-comments` → [PR #2](https://github.com/Jimmychuyucheng/SaveBite/pull/2) |
+| 11-27 | 合併 PR #1、#2（用 merge commit；之後建議改用 squash） | `e9586fe`、`b74fbe6` |
+| 11-27 | A1 本機開發骨架 | `feat/backend-skeleton` |
 
 ---
 
 ## 6. 本機開發
 
-尚未開始。計畫（A 線）：
+### 2026-11-27 A1 本機開發骨架（`feat/backend-skeleton`）
+- **環境**：本機沒有 Python 3.11，用 `uv python install 3.11` 安裝，建立 `backend/.venv`（維持 3.11，和 EC2 的 Amazon Linux 2023 一致）
+- **新增檔案**：
+  - 根目錄：`docker-compose.yml`（postgres:16、redis:7，只綁 127.0.0.1，帳密從 `.env` 讀）、`.env.example`（已填入 CONSOLE_SETUP.md 的 AWS ID，密碼留空）、`.gitignore`、README 本機啟動步驟
+  - `backend/`：`requirements.txt`、`requirements-dev.txt`（版本固定）、`pyproject.toml`（ruff、pytest 設定）
+  - `backend/app/`：`config.py`（pydantic-settings）、`db.py`（asyncpg 連線池、`DbConn` dependency）、`routers/health.py`、`main.py`（`create_app()`、lifespan）
+  - `backend/tests/`：`test_health.py`、`test_db.py`、`conftest.py`
+  - `frontend/`、`lambda/release/`、`load-tests/`、`scripts/`：先放 README 佔位
+- **設計重點**：
+  - 連線池 `min_size=0`，所以 **DB 沒開也能啟動**，連不上只讓該請求回 503（§6.7）
+  - 連線閒置 5 分鐘就關閉，RDS 容錯移轉後會換到新主機
+  - `/health` 不碰 DB
+- **途中處理的問題**：
+  - ruff `B008`：`Depends` 改用 `Annotated` 寫法，定義共用型別 `DbConn`
+  - Starlette 1.10 把 TestClient 依賴的 `httpx` 改成 `httpx2`，舊套件會出現棄用警告，改裝 `httpx2`
+  - 環境變數的優先順序高於 `.env`，所以 `conftest.py` 只在 `.env` 不存在時才給預設的 `DATABASE_URL`，避免蓋掉真實設定
+- **驗證**：
+  - `ruff check`、`ruff format --check` 通過
+  - `pytest` 3 個全過，包含連到真實 PostgreSQL 16 的測試
+  - 實際啟動 uvicorn：DB 正常、執行中停掉 DB、DB 停著才啟動，三種情況 `/health` 都回 200
+- 本機 `.env` 用隨機產生的本機密碼，已確認被 `.gitignore` 排除
 
-- **A1**：repo 目錄、`docker-compose.yml`（postgres:16、redis:7）、FastAPI 骨架（`pydantic-settings`、`/health`、asyncpg 連線池）、`.gitignore`、`.env.example`、README
+### 下一步
 - **A2**：Alembic migration（照 ARCHITECTURE.md 第 5 節的 SQL）
 
 ---
@@ -157,7 +179,7 @@
 - [x] 完成 Scheduler 驗證，把結果寫回 ARCHITECTURE.md §6.3、§11 和 CONSOLE_SETUP.md
 - [x] 刪除 Scheduler 驗證的暫時資源
 - [x] 推送 `docs/scheduler-verification` 並開 PR（含 WORKLOG.md）
-- [ ] 組長確認並合併 PR #1（驗證結果與工作紀錄）、PR #2（模板中文註解）
-- [ ] A1 本機開發骨架
+- [x] 組長確認並合併 PR #1（驗證結果與工作紀錄）、PR #2（模板中文註解）
+- [x] A1 本機開發骨架（PR 待確認）
 - [ ] A2 資料表 migration
 - [ ] runtime stack 建好後：S3 CORS 改成只允許 ALB 網址和 localhost；測試 EC2 能否 PassRole LabRole
