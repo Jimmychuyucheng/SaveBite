@@ -368,10 +368,13 @@ RETURNING l.remaining, l.status, l.version, s.geohash5;
 
 0 列時同樣先查原因：已是 `expired`／`withdrawn` → 結束；仍是 `active`／`sold_out` 且 `pickup_end` 在 5 分鐘內 → 丟出例外重試；`pickup_end` 更晚（已被 PATCH 延後，新排程會另外觸發）→ 結束。成功後發布變動。
 
-**重試與失敗佇列**：Scheduler 呼叫 Lambda 的方式與重試分工**尚待驗證**（見 11，驗證後更新這段）。目前的設計假設：
-- Scheduler retry policy：處理投遞失敗（例如 Lambda 被限流），失敗後送到 SQS DLQ
-- Lambda 非同步設定：`MaximumRetryAttempts=2`，失敗目的地為同一個 SQS DLQ，處理函式丟出的例外
-- Learner Lab 的 Lambda 最多同時 10 個執行環境，大量預約同時到期時會被限流，靠上面兩層重試消化
+**重試與失敗佇列**（2026-11-27 實測驗證，見 11）：
+- Scheduler 用**非同步**方式呼叫 Lambda：只要 Lambda 接受了這次呼叫，Scheduler 就算投遞成功。**函式丟出的例外不會觸發 Scheduler 重試**
+- **函式錯誤由 Lambda 的非同步重試負責**：設定 `MaximumRetryAttempts=2`、`MaximumEventAgeInSeconds=3600`。重試沿用同一個 request ID，間隔約 1 分鐘、2 分鐘，總共最多執行 3 次。用完後由 Lambda 的失敗目的地（on-failure destination）送到 SQS DLQ，訊息內容是 `requestContext.condition = "RetriesExhausted"`，加上原本的 payload 和錯誤訊息
+- Scheduler 的 retry policy 和 DLQ 只處理**投遞失敗**（例如權限錯誤、Lambda 不存在、呼叫被拒），還是要設定
+- 「提早觸發時丟出例外，約 1 分鐘後重試」的做法實測可行
+- 實測觸發時間比排定時間晚 12 到 26 秒（`FlexibleTimeWindow=OFF`），沒有觀察到提早觸發，但排程仍維持延後 1 分鐘的保險
+- Learner Lab 的 Lambda 最多同時 10 個執行環境，大量預約同時到期時會被限流。非同步呼叫被限流時，Lambda 會把事件留在內部佇列自行重試（在 `MaximumEventAgeInSeconds` 內），再不行就由安全網掃描補上
 
 **安全網掃描（每 5 分鐘）**：用一個 EventBridge rule（`rate(5 minutes)`）觸發同一個 Lambda，payload `{"type": "sweep"}`。
 - 用途一：補救排程沒建成、重試用完、訊息進了 DLQ 等情況，確保預約最終一定會被釋出
@@ -565,10 +568,17 @@ docs/                     本文件、CONSOLE_SETUP.md
 
 ## 11. 待確認事項
 
-- **EventBridge Scheduler + LabRole（盡早驗證）**：LabRole 的 trust policy 是否包含 `scheduler.amazonaws.com`、EC2（LabInstanceProfile）能否 `iam:PassRole` LabRole。部署 base stack 後就用測試 Lambda 驗證。**不行的話**：不建立個別排程，完全靠 6.3 的每 5 分鐘安全網掃描（EventBridge rule，不需要執行角色）
-  - 驗證結果：（待填）
-- **重試由哪一層負責（驗證方法）**：測試 Lambda 第一次執行時故意丟出例外，之後成功；Scheduler 設 retry policy 與 DLQ，Lambda 設非同步 `MaximumRetryAttempts`。從 CloudWatch Logs 計算執行次數與間隔，判斷：Scheduler 是同步還是非同步呼叫 Lambda、函式錯誤是由 Scheduler 還是 Lambda 非同步機制重試、最終失敗會進哪個 DLQ。結果寫回這裡並更新 6.3
-  - 驗證結果：（待填）
+- ~~**EventBridge Scheduler + LabRole**~~ ✅ **2026-11-27 已驗證可用**
+  - LabRole 的 trust policy 包含 `scheduler.amazonaws.com`（也包含 `events.amazonaws.com`）
+  - 用 voclabs 身分建立以 LabRole 為執行角色的排程：成功，排程也確實觸發了 Lambda
+  - **還沒驗證**：EC2（LabInstanceProfile）呼叫 `CreateSchedule` 時能否 `iam:PassRole` LabRole，要等 runtime stack 建好，在 EC2 上測
+  - 不需要走退路；安全網掃描照樣保留，用來補救
+- ~~**重試由哪一層負責**~~ ✅ **2026-11-27 已驗證**：由 **Lambda 的非同步重試**負責，結論已寫進 6.3
+  - 方法：測試 Lambda 設非同步 `MaximumRetryAttempts=2`，失敗目的地是 `savebite-dlq`；排程設 retry 2 次、DLQ 也是 `savebite-dlq`。兩個排程在同一時間觸發：`fail-once` 第一次丟例外、之後成功；`fail-always` 每次都丟例外。從 CloudWatch Logs 計算執行次數、間隔和 request ID
+  - `fail-once`：10:48:26 失敗 → 10:49:24 重試成功（同一個 request ID）
+  - `fail-always`：10:48:12、10:49:19、10:51:34 共執行 3 次（同一個 request ID，間隔約 1 分鐘、2 分鐘）→ DLQ 收到 1 則 Lambda 失敗目的地的訊息（`condition = RetriesExhausted`、`approximateInvokeCount = 3`）
+  - 判斷：request ID 不變而且次數等於 Lambda 的設定，代表是 Lambda 在重試；Scheduler 沒有額外重試（Scheduler 重試的話 request ID 會換新）
+  - 一次性排程設了 `ActionAfterCompletion=DELETE`，執行完確實自動刪除
 - **ElastiCache**：Learner Lab 實際建立時是否可用
 - **只有 HTTP**：Learner Lab 不能註冊網域，ALB 沒有正式憑證，只能用 HTTP，登入密碼以明文傳輸。課程專案可接受，報告中要列為已知限制
 - 預約保留時間（目前預設 30 分鐘）、每人每次預約上限、未登入輪詢間隔、WebSocket 訂閱格子上限
